@@ -11,10 +11,11 @@
  * detaches the debug sessions that daemon left attached, so the next daemon starts clean.
  *
  * Quitting Chrome leaves it closed: the holder stays up, removes the Chrome socket, and starts Chrome
- * again only when something connects to the launch socket (the daemon, when a chat needs a profile,
- * or the Dock launcher bin/cbb-chrome). The holder outlives Chrome, so launchd never relaunches it.
+ * again only when something connects to the launch socket (the daemon, when a chat needs a profile).
+ * The holder outlives Chrome, so launchd never relaunches it. A Chrome opened any other way while
+ * ours is closed (its Dock icon, a link from another app) is quit cleanly and reopened here.
  */
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -36,10 +37,26 @@ export type HolderOptions = {
   launchAtStart?: boolean;
 };
 
+/** Chrome's own data dir on macOS; in full-CDP mode a symlink to the holder's dir. */
+const DEFAULT_DIR = path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome");
+const realpath = (p: string): string => {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+};
+
 /** Any connection here starts Chrome if it is not running. Lives next to the Chrome socket. */
 export const launchSocketFor = (socketPath: string): string => path.join(path.dirname(socketPath), "chrome-launch.sock");
 
-export function startHolder(opts: HolderOptions): { readonly chromePid: number | undefined; launch: () => void; close: () => void } {
+export function startHolder(opts: HolderOptions): {
+  readonly chromePid: number | undefined;
+  /** No Chrome of ours and none being taken over: a holder restart would close nothing. */
+  readonly idle: boolean;
+  launch: () => void;
+  close: () => void;
+} {
   let chrome: ChildProcess | null = null;
   let toChrome: NodeJS.WritableStream | null = null;
   let server: net.Server | null = null;
@@ -47,6 +64,7 @@ export function startHolder(opts: HolderOptions): { readonly chromePid: number |
   const sessions = new Set<string>(); // debug sessions attached through the current client
   let ownId = OWN_ID_BASE;
   let closing = false;
+  let adopting = false; // quitting a Chrome that started without the pipe, to reopen it here
 
   /** Watch for sessions opening and closing, without parsing every (possibly huge) message. */
   const track = (raw: string): void => {
@@ -75,12 +93,12 @@ export function startHolder(opts: HolderOptions): { readonly chromePid: number |
   const NUL = Buffer.from([0]);
 
   /** Start Chrome on the pipe and serve it on socketPath while it runs. No-op while it runs. */
-  const launch = (): void => {
-    if (chrome) return;
+  const launch = (extra: string[] = []): void => {
+    if (chrome || adopting) return; // an adoption launches as soon as the other Chrome is gone
     const startedAt = Date.now();
     const proc = spawn(
       opts.chromeBinary,
-      ["--remote-debugging-pipe", `--user-data-dir=${opts.userDataDir}`, "--no-first-run", "--no-default-browser-check", ...(opts.extraArgs ?? [])],
+      ["--remote-debugging-pipe", `--user-data-dir=${opts.userDataDir}`, "--no-first-run", "--no-default-browser-check", ...extra, ...(opts.extraArgs ?? [])],
       { stdio: ["ignore", "ignore", "inherit", "pipe", "pipe"] },
     );
     chrome = proc;
@@ -156,13 +174,53 @@ export function startHolder(opts: HolderOptions): { readonly chromePid: number |
   launcher.listen(launchSocket, () => fs.chmodSync(launchSocket, 0o600));
   if (opts.launchAtStart ?? true) launch();
 
+  // A Chrome opened any other way (its Dock icon, a link from another app, an update relaunch) has
+  // no pipe, so no agent could drive it, and it holds the data dir so ours cannot start. While ours is
+  // closed, look for one each second; quit it cleanly (SIGTERM saves the session, like Cmd+Q) and
+  // reopen Chrome here with its tabs brought back: its window closes and reopens within seconds.
+  const ourDir = realpath(opts.userDataDir);
+  const defaultIsOurs = realpath(DEFAULT_DIR) === ourDir;
+  const binaryPattern = `^${opts.chromeBinary.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}( |$)`;
+  const otherBrowsers = (): number[] =>
+    (spawnSync("pgrep", ["-f", binaryPattern], { encoding: "utf8" }).stdout ?? "")
+      .split("\n")
+      .map(Number)
+      .filter((pid) => {
+        if (!pid) return false;
+        const args = spawnSync("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8" }).stdout ?? "";
+        if (!args || args.includes("--type=")) return false; // gone, or a helper rather than a browser
+        const dir = /--user-data-dir=(\S+)/.exec(args)?.[1];
+        return dir ? realpath(dir) === ourDir : defaultIsOurs; // never touch another data dir's Chrome
+      });
+  const watcher = setInterval(() => {
+    if (chrome || adopting || closing) return;
+    const pids = otherBrowsers();
+    if (!pids.length) return;
+    adopting = true;
+    log.warn(`Chrome ${pids.join(",")} started without the pipe; quitting it to reopen it through the holder`);
+    for (const pid of pids) try { process.kill(pid, "SIGTERM"); } catch {}
+    const since = Date.now();
+    const gone = setInterval(() => {
+      const alive = pids.some((pid) => { try { process.kill(pid, 0); return true; } catch { return false; } });
+      if (alive && Date.now() - since < 20_000) return;
+      clearInterval(gone);
+      adopting = false;
+      launch(["--restore-last-session"]);
+    }, 250);
+  }, 1_000);
+  watcher.unref();
+
   return {
     get chromePid() {
       return chrome?.pid;
     },
+    get idle() {
+      return !chrome && !adopting;
+    },
     launch,
     close: () => {
       closing = true;
+      clearInterval(watcher);
       launcher.close();
       server?.close();
       chrome?.kill();
@@ -174,7 +232,7 @@ if (import.meta.main) {
   const home = process.env.CBB_HOME || path.join(process.env.HOME ?? "", ".claude-browser-bridge");
   const udd = process.env.CBB_CHROME_UDD;
   if (!udd) throw new Error("holder: CBB_CHROME_UDD (a non-default Chrome data dir) is required");
-  startHolder({
+  const holder = startHolder({
     chromeBinary: process.env.CBB_CHROME_BIN || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     userDataDir: udd,
     socketPath: process.env.CBB_CHROME_SOCKET || path.join(home, "chrome.sock"),
@@ -185,4 +243,15 @@ if (import.meta.main) {
     launchAtStart: os.uptime() < 600,
   });
   // The launch socket keeps this process alive with Chrome closed; launchd restarts it only on a crash.
+  // ship.sh never restarts the holder (that would close Chrome), so take new code once Chrome is
+  // closed, when a restart closes nothing: exit, and launchd's KeepAlive starts the new code.
+  const versionFile = path.join(path.dirname(import.meta.dirname), "VERSION");
+  const readVersion = () => { try { return fs.readFileSync(versionFile, "utf8").trim(); } catch { return ""; } };
+  const running = readVersion();
+  setInterval(() => {
+    const next = readVersion();
+    if (!holder.idle || !next || next === running) return;
+    log.info(`new code ${next.slice(0, 7)}; restarting while Chrome is closed`);
+    process.exit(0);
+  }, 5_000);
 }

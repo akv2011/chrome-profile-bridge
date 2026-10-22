@@ -1,4 +1,4 @@
-import type { ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -85,4 +85,22 @@ describe("holder: the daemon restarts, Chrome does not", () => {
     expect(holder.chromePid).not.toBe(first);
     await daemon.close();
   }, 120_000);
+
+  it("quits a Chrome started without the pipe and reopens it through the holder", async () => {
+    const sock = path.join(home, "chrome.sock");
+    for (const p of procs.splice(0)) p.kill();
+    process.kill(holder.chromePid as number);
+    for (let i = 0; i < 40 && fs.existsSync(sock); i++) await new Promise((r) => setTimeout(r, 250));
+    expect(holder.chromePid).toBeUndefined();
+
+    // Stands in for Chrome opened from the Dock: same binary and data dir, no pipe.
+    const stray = spawn(chromium.executablePath(), [`--user-data-dir=${udd}`, "--headless=new", "--no-first-run", "about:blank"], { stdio: "ignore" });
+    const strayExit = new Promise((r) => stray.on("exit", r));
+    for (let i = 0; i < 80 && !holder.chromePid; i++) await new Promise((r) => setTimeout(r, 250));
+    await strayExit;
+    expect(holder.chromePid, "the holder reopened Chrome on the pipe").toBeGreaterThan(0);
+    expect(holder.chromePid).not.toBe(stray.pid);
+    for (let i = 0; i < 20 && !fs.existsSync(sock); i++) await new Promise((r) => setTimeout(r, 250));
+    expect(fs.existsSync(sock)).toBe(true);
+  }, 60_000);
 });
