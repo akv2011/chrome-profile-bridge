@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+// cbb-mcp <profile> [--client <name>]
+//
+// The MCP server for one Chrome profile: runs @playwright/mcp against the bridge daemon, keyed by
+// a client name so each client gets its own tab group (and gets it back after a reconnect). Point
+// your pw-<profile> MCP entry at this. On macOS Chrome and the daemon are local.
+import { execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createRequire } from "node:module";
+
+const [profile, flag, value] = process.argv.slice(2);
+if (!profile || !/^[\w.@-]+$/.test(profile)) {
+  console.error("usage: cbb-mcp <profile> [--client <name>]");
+  process.exit(2);
+}
+
+/** The client this server belongs to: the nearest ancestor process with a Claude Code session record. */
+function clientName() {
+  let pid = process.ppid;
+  for (let hop = 0; hop < 10 && pid > 1; hop++) {
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".claude", "sessions", `${pid}.json`), "utf8"));
+      if (record.name) return record.name;
+      if (record.sessionId) return `client-${record.sessionId.slice(0, 8)}`;
+    } catch {
+      // not a session process; keep walking up
+    }
+    try {
+      pid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim());
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+const raw = flag === "--client" && value ? value : (clientName() ?? `client-${process.pid}`);
+const client = raw.replace(/[^\w.@-]/g, "_").slice(0, 60);
+const endpoint = `ws://127.0.0.1:${process.env.CBB_PORT || 18765}/cdp/${profile}?client=${encodeURIComponent(client)}`;
+const cli = path.join(path.dirname(createRequire(import.meta.url).resolve("@playwright/mcp/package.json")), "cli.js");
+
+// node by full path: a client launched from Finder or an IDE can have a bare PATH.
+const child = spawn(process.execPath, [cli, "--cdp-endpoint", endpoint], { stdio: "inherit" });
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => child.kill(signal));
+child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));

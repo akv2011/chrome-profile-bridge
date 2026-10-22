@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Claude Browser Bridge</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body { font: 13px/1.45 system-ui, sans-serif; width: 280px; margin: 0; padding: 14px; background: Canvas; color: CanvasText; }
+      h1 { font-size: 14px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+      .dot { width: 10px; height: 10px; border-radius: 50%; background: #8e8e93; flex: none; }
+      .dot.on { background: #34c759; }
+      .dot.connecting { background: #f59e0b; }
+      .dot.error { background: #ff3b30; }
+      dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; }
+      dt { color: GrayText; }
+      dd { margin: 0; overflow-wrap: anywhere; }
+      p { margin: 10px 0 0; color: GrayText; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1><span class="dot" id="dot"></span><span id="headline">Checking…</span></h1>
+    <dl>
+      <dt>Profile</dt><dd id="email">…</dd>
+      <dt>Chats</dt><dd id="chats">…</dd>
+      <dt>Tabs</dt><dd id="tabs">…</dd>
+      <dt>Version</dt><dd id="version">…</dd>
+    </dl>
+    <p id="note"></p>
+    <script src="popup.js" type="module"></script>
+  </body>
+</html>

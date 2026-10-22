@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Profile Bridge",
+  "version": "0.1.0",
+  "description": "Lets local automation tools (Playwright, MCP) drive this Chrome profile through the bridge daemon. Each client works in its own tab group.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqe79/q6e9S29XXgJIpp2T0a0ithXrXdJDxDBLc2GEaO7GQKcNPSyRxG4hM5MK0X31ThHVQ3a0lGk71JGurKR6x3wpsYTLGzrOfKSCUqQI1uEZ7XSPVBh8g0m+jokz0hkKsvHwd2FpaduJdKBQYEY384urRepA4rXZDOWSXgfl4HgX6MMsEsxcyrNabBG9CFyqui6KAfcxjZPvGREe4zcFlhCPCOdtPLnp5ORgTeYN8Q3eqypLG4qLtjoF7DkYD8xY7NvMBr3wlChvzY1RhX4wPNJAUHY/DFMmyDnHt8NpQRrG1gMWVcEYTnohvqp9U8I3d4Io509gEj+RKEdz6MqJQIDAQAB",
+  "minimum_chrome_version": "125",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "storage",
+    "alarms",
+    "identity",
+    "identity.email"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Claude Browser Bridge",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
