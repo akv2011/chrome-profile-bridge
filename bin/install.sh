@@ -83,6 +83,7 @@ if [ "$FULL" = 1 ]; then
     osacompile -o "$APP" -e 'do shell script "$HOME/.local/bin/cbb-chrome"'
     cp "/Applications/Google Chrome.app/Contents/Resources/app.icns" "$APP/Contents/Resources/applet.icns"
     /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string local.chrome-profile-bridge.launcher" "$APP/Contents/Info.plist"
     codesign --force --deep -s - "$APP"
     echo "install: Dock launcher at $APP (drag it to the Dock in place of Chrome)"
   fi
