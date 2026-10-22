@@ -36,8 +36,9 @@ beforeAll(() => {
 afterAll(() => {
   for (const p of procs) p.kill();
   holder?.close();
-  fs.rmSync(home, { recursive: true, force: true });
-  fs.rmSync(udd, { recursive: true, force: true });
+  // Chrome is still writing its profile while it exits; rmSync retries ENOTEMPTY.
+  fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  fs.rmSync(udd, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 describe("holder: the daemon restarts, Chrome does not", () => {
@@ -62,5 +63,26 @@ describe("holder: the daemon restarts, Chrome does not", () => {
     expect(heapBytes(await b("browser_run_code_unsafe", { code: HEAP_SNAPSHOT_CODE }))).toBeGreaterThan(0);
     expect(alive()).toBe(true);
     await second.close();
+  }, 120_000);
+
+  it("leaves a quit Chrome closed until a chat needs a profile, then starts it again", async () => {
+    const sock = path.join(home, "chrome.sock");
+    const first = holder.chromePid as number;
+    for (const p of procs.splice(0)) p.kill();
+    process.kill(first); // stands in for Cmd+Q
+    for (let i = 0; i < 40 && fs.existsSync(sock); i++) await new Promise((r) => setTimeout(r, 250));
+    expect(fs.existsSync(sock), "the Chrome socket goes with Chrome").toBe(false);
+    await new Promise((r) => setTimeout(r, 2_000));
+    expect(holder.chromePid, "nothing reopens a quit Chrome on its own").toBeUndefined();
+
+    const daemon = await daemonOn(sock); // a daemon (re)start with Chrome closed must not open it
+    await new Promise((r) => setTimeout(r, 1_000));
+    expect(holder.chromePid).toBeUndefined();
+
+    const c = await mcpClient(`ws://127.0.0.1:${daemon.port}/cdp/pw-test?client=H3`, procs);
+    expect(await c("browser_navigate", { url: "https://example.com/?reopened" })).toContain("Example Domain");
+    expect(holder.chromePid).toBeGreaterThan(0);
+    expect(holder.chromePid).not.toBe(first);
+    await daemon.close();
   }, 120_000);
 });

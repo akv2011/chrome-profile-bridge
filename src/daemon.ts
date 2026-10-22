@@ -12,9 +12,11 @@ import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http, { type IncomingMessage } from "node:http";
+import net from "node:net";
 import path from "node:path";
 import type { Duplex } from "node:stream";
 import { type RawData, type WebSocket, WebSocketServer } from "ws";
+import { launchSocketFor } from "./holder.ts";
 import { createLogger } from "./log.ts";
 import { ChromePipe } from "./pipe.ts";
 import { drivePipeProfile } from "./pipe-driver.ts";
@@ -180,8 +182,19 @@ export async function startDaemon(opts: DaemonOptions) {
         opts.onPipeLost?.();
       },
     });
-    await pipe.start();
+    // Holder mode connects lazily (ensurePipe): a quit Chrome stays closed until a chat needs it.
+    if (!opts.pipe.socketPath) await pipe.start();
   }
+
+  // The agent is stuck (captcha, login, a Chrome the bridge cannot reach) and needs you. Run
+  // CBB_NOTIFY_CMD with the message as its one argument ($1, never parsed by the shell), so you can
+  // wire any notifier (a script, a desktop toast); no-op if unset.
+  const notify =
+    opts.notify ??
+    ((message: string) => {
+      const cmd = process.env.CBB_NOTIFY_CMD;
+      if (cmd) spawn("/bin/sh", ["-c", `${cmd} "$1"`, "sh", message], { detached: true, stdio: "ignore" }).unref();
+    });
 
   // contextId -> its profile dir (string), or null for a confirmed non-profile context. A read that
   // merely failed (context tearing down, createTarget race) is NEVER cached, so it is retried, not
@@ -268,7 +281,14 @@ export async function startDaemon(opts: DaemonOptions) {
         fresh = (await openContexts()).find((c) => !before.has(c)) ?? null;
       }
       if (fresh) contextDirs.set(fresh, wantPath); // the new window is this profile
-      const strays = (await pipe.pageTargets()).filter((p) => !beforeTargets.has(p.targetId) && NEW_TAB.test(p.url)).map((p) => p.targetId);
+      // The context can appear before its window's new-tab page does (Profile 44 resolved in 0.7 s
+      // with no stray, leaving the blank window open), so give that tab up to 2 s to show up.
+      let strays: string[] = [];
+      for (let i = 0; i < 5; i++) {
+        strays = (await pipe.pageTargets()).filter((p) => !beforeTargets.has(p.targetId) && NEW_TAB.test(p.url)).map((p) => p.targetId);
+        if (strays.length) break;
+        await new Promise((r) => setTimeout(r, 400));
+      }
       return { contextId: fresh, strays };
     };
     const next = launchLock.then(run, run);
@@ -334,6 +354,7 @@ export async function startDaemon(opts: DaemonOptions) {
 
   const buildOrReuse = async (name: string): Promise<void> => {
     if (!pipe) return;
+    await ensurePipe(true);
     const wantDir = profileDirForName(name, env);
     if (!wantDir) throw new Error(`${name}: no Chrome profile directory mapped (profiles.json)`);
     const wantPath = `${chromeDir(env)}/${wantDir}`;
@@ -363,9 +384,30 @@ export async function startDaemon(opts: DaemonOptions) {
     log.info(`${name}: full-CDP driver ready (context ${ctx.slice(0, 8)}, ${email})`);
   };
 
-  // Warm the cache for whatever profiles the holder's Chrome restored, so the first connects are
-  // cache hits instead of a burst of chrome://version reads.
-  if (pipe) void warmContexts().catch(() => {});
+  // Holder mode: connect to Chrome, and with `launch` ask the holder to start it first. A quit Chrome
+  // stays closed until a chat needs a profile. Once connected, warm the cache for the profiles Chrome
+  // restored, so the first connects are cache hits instead of a burst of chrome://version reads.
+  let connecting: Promise<void> | null = null;
+  let lastLaunchPing = 0;
+  const ensurePipe = (launch: boolean): Promise<void> => {
+    const socketPath = opts.pipe?.socketPath;
+    if (!pipe || !socketPath || (pipe.running && !connecting)) return Promise.resolve();
+    if (launch) net.connect(launchSocketFor(socketPath)).on("error", () => {}).end();
+    connecting ??= pipe
+      .start()
+      .then(() => void warmContexts().catch(() => {}))
+      .finally(() => (connecting = null));
+    return connecting.catch((err) => {
+      if (!launch) throw err;
+      if (Date.now() - lastLaunchPing > 10 * 60_000) {
+        lastLaunchPing = Date.now();
+        notify("Question: Chrome is open outside the bridge (Dock?); quit it (Cmd+Q) so agents can use it");
+      }
+      throw new Error(`Chrome did not start on the bridge (${String(err)}). If Chrome was opened from the Dock, quit it (Cmd+Q) and retry: the bridge reopens it.`);
+    });
+  };
+  if (pipe?.running) void warmContexts().catch(() => {});
+  else if (opts.pipe?.socketPath && fs.existsSync(opts.pipe.socketPath)) void ensurePipe(false).catch(() => {});
 
   const openProfile =
     opts.openProfile ??
@@ -401,14 +443,7 @@ export async function startDaemon(opts: DaemonOptions) {
         extensionWaitMs: opts.extensionWaitMs,
         endedGroupTtlMs: opts.endedGroupTtlMs,
         timelineDir: path.join(bridgeHome(env), "timeline"),
-        notify:
-          opts.notify ??
-          ((message: string) => {
-            // The agent is stuck on a captcha/login and asked for you. Run CBB_NOTIFY_CMD with the
-            // message so you can wire any notifier (a script, a desktop toast); no-op if unset.
-            const cmd = process.env.CBB_NOTIFY_CMD;
-            if (cmd) spawn(cmd, [message], { shell: true, detached: true, stdio: "ignore" }).unref();
-          }),
+        notify,
         secretSource:
           opts.secretSource ??
           ((service: string, account: string) =>

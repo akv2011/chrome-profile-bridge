@@ -1,0 +1,14 @@
+#!/bin/sh
+# Open Chrome through the bridge. install.sh wraps this in ~/Applications/Chrome Bridge.app for the Dock.
+#
+# A quit Chrome stays closed until something asks for it. Chrome opened from its own Dock icon has no
+# debugging pipe, so agents cannot drive it until it is quit. This asks the holder to start Chrome (a
+# no-op while it runs), waits for it, then brings it to the front.
+SOCK="$HOME/.chrome-profile-bridge/chrome-launch.sock"
+if [ -S "$SOCK" ] && /usr/bin/nc -U "$SOCK" </dev/null >/dev/null 2>&1; then
+  for _ in $(seq 1 40); do
+    [ "$(/usr/bin/osascript -e 'application id "com.google.Chrome" is running')" = true ] && break
+    sleep 0.25
+  done
+fi
+exec /usr/bin/open -b com.google.Chrome

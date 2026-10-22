@@ -66,7 +66,11 @@ Across profiles: `bin/cbb-fanout <name…> [--url <url>] -- "<expression>"` runs
   profiling, `Memory`, `DOMStorage`, `IndexedDB`, `ServiceWorker` and `Security`. Switch to it
   with `bin/full-cdp.sh` (moves Chrome's data to `~/ChromeData` and symlinks the default path
   back, reversible with `--undo`). Because the holder owns Chrome separately from the daemon, a
-  daemon update or crash never closes your browser. See [`docs/full-cdp.md`](docs/full-cdp.md).
+  daemon update or crash never closes your browser. Quitting Chrome leaves it closed; the next
+  client that needs a profile starts it again. To open it yourself, use
+  `~/Applications/Chrome Bridge.app` (install.sh makes it; keep it in the Dock in place of Chrome):
+  Chrome's own icon starts it without the pipe, and clients fail until you quit that one. See
+  [`docs/full-cdp.md`](docs/full-cdp.md).
 - **Extension.** Each profile loads the unpacked extension, which uses `chrome.debugger`. Chrome
   gives that an untrusted CDP session and refuses seven domains (DOMStorage, IndexedDB,
   ServiceWorker, Security, Profiler, Memory, HeapProfiler); most have a workaround (page JS for

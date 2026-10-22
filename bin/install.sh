@@ -74,6 +74,18 @@ if [ "$FULL" = 1 ]; then
   plist "$LABEL" daemon.ts "$PIPE_ENV" daemon
   # Never restart a running holder: that closes Chrome. Start it only if it is not loaded.
   launchctl print "gui/$U/$LABEL.chrome" >/dev/null 2>&1 || launchctl bootstrap "gui/$U" "$HOME/Library/LaunchAgents/$LABEL.chrome.plist"
+  # A quit Chrome stays closed until a client needs it. Chrome's own Dock icon would start it without
+  # the pipe, so the Dock gets this launcher instead: it starts Chrome through the holder.
+  install -m 755 "$SRC/bin/cbb-chrome" "$HOME/.local/bin/cbb-chrome"
+  APP="$HOME/Applications/Chrome Bridge.app"
+  if [ ! -d "$APP" ]; then
+    mkdir -p "$HOME/Applications"
+    osacompile -o "$APP" -e 'do shell script "$HOME/.local/bin/cbb-chrome"'
+    cp "/Applications/Google Chrome.app/Contents/Resources/app.icns" "$APP/Contents/Resources/applet.icns"
+    /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$APP/Contents/Info.plist"
+    codesign --force --deep -s - "$APP"
+    echo "install: Dock launcher at $APP (drag it to the Dock in place of Chrome)"
+  fi
 else
   mkdir -p -m 700 "$HOME_DIR/extension"
   rsync -a --delete --exclude '*.test.ts' "$SRC/extension/" "$HOME_DIR/extension/"

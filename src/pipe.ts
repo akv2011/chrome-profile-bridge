@@ -107,6 +107,8 @@ export class ChromePipe {
     if (!sock) throw new Error(`no Chrome holder on ${socketPath}`);
     this.conn = sock;
     this.toChrome = sock;
+    this.framer.reset();
+    let up = false;
     sock.on("data", (chunk: Buffer) => this.onData(chunk));
     sock.on("close", () => {
       log.warn("holder connection closed (Chrome closed or the holder restarted)");
@@ -115,12 +117,14 @@ export class ChromePipe {
       for (const p of this.pending.values()) p.reject(new Error("holder connection closed"));
       this.pending.clear();
       this.sessionTarget.clear();
-      this.opts.onExit?.(null);
+      // A Chrome that closes before it answered is a failed start (start() rejects), not a lost browser.
+      if (up) this.opts.onExit?.(null);
     });
     await Promise.race([
       this.send("Browser.getVersion"),
       new Promise((_, reject) => setTimeout(() => reject(new Error("the holder did not answer within 15 s")), 15_000)),
     ]);
+    up = true;
     await this.send("Target.setDiscoverTargets", { discover: true }).catch(() => {});
     log.info(`connected to Chrome through the holder (${socketPath})`);
   }
