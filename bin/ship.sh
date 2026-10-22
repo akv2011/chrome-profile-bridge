@@ -14,4 +14,7 @@ if ! cmp -s "$SRC/package-lock.json" "$APP/package-lock.json"; then
   cp "$SRC/package.json" "$SRC/package-lock.json" "$APP/"
   (cd "$APP" && PATH=/opt/homebrew/bin:$PATH npm ci --omit=dev --no-audit --no-fund --loglevel=error)
 fi
-git -C "$SRC" rev-parse HEAD > "$APP/VERSION"
+# VERSION is a hash of what was shipped, not the commit, so a commit that only touches docs or the
+# installer leaves it unchanged and the daemon does not restart for nothing.
+find "$APP/src" "$APP/package-lock.json" "$EXT" -type f -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 \
+  | sed "s#$HOME##" | shasum -a 256 | cut -c1-40 > "$APP/VERSION"

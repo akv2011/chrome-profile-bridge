@@ -77,14 +77,28 @@ if [ "$FULL" = 1 ]; then
   # A quit Chrome stays closed until a client needs it. Chrome's own Dock icon would start it without
   # the pipe, so the Dock gets this launcher instead: it starts Chrome through the holder.
   install -m 755 "$SRC/bin/cbb-chrome" "$HOME/.local/bin/cbb-chrome"
+  # A plain app bundle around cbb-chrome, with Chrome's icon. An osacompile applet showed the generic
+  # script icon (its Assets.car wins over a copied .icns) and started slower.
   APP="$HOME/Applications/Chrome Bridge.app"
-  if [ ! -d "$APP" ]; then
-    mkdir -p "$HOME/Applications"
-    osacompile -o "$APP" -e 'do shell script "$HOME/.local/bin/cbb-chrome"'
-    cp "/Applications/Google Chrome.app/Contents/Resources/app.icns" "$APP/Contents/Resources/applet.icns"
-    /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$APP/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string local.chrome-profile-bridge.launcher" "$APP/Contents/Info.plist"
-    codesign --force --deep -s - "$APP"
+  if [ ! -x "$APP/Contents/MacOS/Chrome Bridge" ]; then
+    rm -rf "$APP"
+    mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+    printf '#!/bin/sh\nexec "$HOME/.local/bin/cbb-chrome"\n' > "$APP/Contents/MacOS/Chrome Bridge"
+    chmod 755 "$APP/Contents/MacOS/Chrome Bridge"
+    cp "/Applications/Google Chrome.app/Contents/Resources/app.icns" "$APP/Contents/Resources/app.icns"
+    cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>Chrome Bridge</string>
+  <key>CFBundleIdentifier</key><string>local.chrome-profile-bridge.launcher</string>
+  <key>CFBundleName</key><string>Chrome Bridge</string>
+  <key>CFBundleIconFile</key><string>app</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSUIElement</key><true/>
+</dict></plist>
+PLIST
+    codesign --force -s - "$APP"
     echo "install: Dock launcher at $APP (drag it to the Dock in place of Chrome)"
   fi
 else
