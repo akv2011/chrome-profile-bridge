@@ -9,14 +9,14 @@ import os from "node:os";
 import path from "node:path";
 
 export function bridgeHome(env: NodeJS.ProcessEnv = process.env): string {
-  return env.CBB_HOME || path.join(os.homedir(), ".chrome-profile-bridge");
+  return env.CBB_HOME || path.join(os.homedir(), ".claude-browser-bridge");
 }
 
 export function chromeDir(env: NodeJS.ProcessEnv = process.env): string {
   return env.CBB_CHROME_DIR || path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome");
 }
 
-/** name -> Chrome profile dir, e.g. { "pw-example": "Profile 42" }. */
+/** name -> Chrome profile dir, e.g. { "pw-example": "Profile 1" }. */
 export function loadProfiles(env: NodeJS.ProcessEnv = process.env): Map<string, string> {
   try {
     const raw = JSON.parse(fs.readFileSync(path.join(bridgeHome(env), "profiles.json"), "utf8")) as Record<string, unknown>;

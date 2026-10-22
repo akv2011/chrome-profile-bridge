@@ -18,13 +18,23 @@ daemon owns Chrome's launch, which is how it holds the pipe.
 
 ## How it works
 
-Set `CBB_CHROME_UDD` to a non-default Chrome data directory (a symlink to your real one is fine;
-the switch value just has to differ from the default path string). The daemon then launches Chrome
-with `--remote-debugging-pipe --load-extension=<extension> --user-data-dir=$CBB_CHROME_UDD`, speaks
-CDP over the pipe (one trusted connection to the whole browser), and drives real page targets. The
-extension still provides identity, tab groups and tab lifecycle, and reports each tab's CDP
-targetId so the daemon knows which real target to drive. The `browser_*` tool surface does not
-change; it only gains the domains Chrome otherwise blocks.
+`bin/full-cdp.sh` moves Chrome's data to `~/ChromeData` (a rename on the same disk) and symlinks
+the default path back to it. The directory has to be physically non-default: Chrome 136 resolves a
+symlink and refuses the pipe if it still points at the default location, so moving the data, not
+just linking to it, is what satisfies the check. A holder (`src/holder.ts`) then launches Chrome
+with `--remote-debugging-pipe --user-data-dir=~/ChromeData` and serves the pipe on an owner-only
+unix socket; the daemon connects to that socket and drives real page targets over one trusted CDP
+connection to the whole browser.
+
+There is no extension. The daemon tells profiles apart by opening `chrome://version` in each
+browser context and reading its profile path, and it opens a closed profile on demand with
+`--profile-directory`. It tracks each client's own tabs for isolation. The `browser_*` tool
+surface does not change; it only gains the domains Chrome otherwise blocks.
+
+Because the holder owns Chrome and the pipe, the daemon can restart (to update itself, or after a
+crash) without closing the browser: it just reconnects to the socket, and the holder detaches the
+previous daemon's debug sessions so the new one starts clean. Chrome only restarts if Chrome itself
+exits, and launchd brings the holder back.
 
 On macOS your logins survive a non-default data dir because the cookie-encryption key lives in the
 Keychain, not the path.

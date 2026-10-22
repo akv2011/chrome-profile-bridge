@@ -1,45 +1,13 @@
-import { type ChildProcess, spawn } from "node:child_process";
-import { createRequire } from "node:module";
-import path from "node:path";
+import type { ChildProcess } from "node:child_process";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { mcpClient } from "./testing/mcp-client.ts";
 import { startStack } from "./testing/stack.ts";
-
-const cli = path.join(path.dirname(createRequire(import.meta.url).resolve("@playwright/mcp/package.json")), "cli.js");
 
 let stack: Awaited<ReturnType<typeof startStack>>;
 const servers: ChildProcess[] = [];
 
 /** The same playwright-mcp the pw-* tools run, as an agent sees it: JSON-RPC over stdio. */
-async function mcp(client: string) {
-  const proc = spawn(process.execPath, [cli, "--cdp-endpoint", stack.cdpUrl(client)], { stdio: ["pipe", "pipe", "ignore"] });
-  servers.push(proc);
-  const waiting = new Map<number, (msg: { result?: { content?: Array<{ text?: string }> }; error?: unknown }) => void>();
-  let buffer = "";
-  let nextId = 1;
-  proc.stdout?.on("data", (chunk) => {
-    buffer += String(chunk);
-    for (let i = buffer.indexOf("\n"); i >= 0; i = buffer.indexOf("\n")) {
-      const line = buffer.slice(0, i).trim();
-      buffer = buffer.slice(i + 1);
-      if (!line) continue;
-      const msg = JSON.parse(line);
-      waiting.get(msg.id)?.(msg);
-      waiting.delete(msg.id);
-    }
-  });
-  const request = (method: string, params: unknown) =>
-    new Promise<{ result?: { content?: Array<{ text?: string }> }; error?: unknown }>((resolve) => {
-      const id = nextId++;
-      waiting.set(id, resolve);
-      proc.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-    });
-  await request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "bridge-test", version: "0" } });
-  proc.stdin?.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
-  return async (name: string, args: Record<string, unknown> = {}) => {
-    const reply = await request("tools/call", { name, arguments: args });
-    return reply.result?.content?.map((part) => part.text ?? "").join("\n") ?? `ERROR ${JSON.stringify(reply.error)}`;
-  };
-}
+const mcp = (client: string) => mcpClient(stack.cdpUrl(client), servers);
 
 beforeAll(async () => {
   stack = await startStack();
@@ -60,6 +28,27 @@ describe("playwright-mcp 0.0.82 through the bridge", () => {
     expect(await call("browser_click", { element: "Go button", target: ref })).not.toContain("### Error");
     await call("browser_wait_for", { time: 1 });
     expect(await call("browser_network_requests", { static: false })).toContain("/api");
+  }, 90_000);
+
+  it("reaches the full trusted-CDP domains through the agent tool (heap snapshot, Profiler, Memory, DOMStorage)", async () => {
+    const call = await mcp("MCP_FULL");
+    await call("browser_navigate", { url: stack.siteUrl });
+    const code = `async (page) => {
+      const s = await page.context().newCDPSession(page);
+      const out = {};
+      let heap = 0; s.on("HeapProfiler.addHeapSnapshotChunk", (e) => (heap += e.chunk.length));
+      await s.send("HeapProfiler.enable"); await s.send("HeapProfiler.takeHeapSnapshot", { reportProgress: false });
+      out.heapSnapshotBytes = heap;
+      await s.send("Profiler.enable"); await s.send("Profiler.start"); out.profilerNodes = (await s.send("Profiler.stop")).profile.nodes.length;
+      out.domCounterNodes = (await s.send("Memory.getDOMCounters")).nodes;
+      await s.send("DOMStorage.enable"); out.domStorage = "ok";
+      return JSON.stringify(out);
+    }`;
+    const result = await call("browser_run_code_unsafe", { code });
+    const num = (key: string) => Number(new RegExp(`"${key}\\\\?":\\s*(\\d+)`).exec(result)?.[1] ?? "0");
+    expect(num("heapSnapshotBytes"), `tool output: ${result.slice(0, 300)}`).toBeGreaterThan(0);
+    expect(num("profilerNodes")).toBeGreaterThan(0);
+    expect(result).toContain("domStorage");
   }, 90_000);
 
   it("gives two agents on one profile their own tabs", async () => {

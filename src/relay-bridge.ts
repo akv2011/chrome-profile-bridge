@@ -30,9 +30,9 @@ const EXTENSION_WAIT_MS = 20_000;
 /** An ended chat's tabs close after this unless a client with the same key comes back. */
 const ENDED_GROUP_TTL_MS = 10 * 60_000;
 
-const BROWSER_TARGET_ID = "chrome-profile-bridge";
+const BROWSER_TARGET_ID = "claude-browser-bridge";
 /** Playwright requires every attached page target to identify its browser context. */
-const BROWSER_CONTEXT_ID = "chrome-profile-bridge-context";
+const BROWSER_CONTEXT_ID = "claude-browser-bridge-context";
 
 /** Minimal socket seam so tests can drive the bridge without real WebSockets. */
 export type BridgeSocket = {
@@ -733,7 +733,7 @@ export class ExtensionRelayBridge {
         this.respond(client, request, {
           protocolVersion: "1.3",
           product: identity?.browserVersion ?? "Chrome/unknown",
-          revision: "chrome-profile-bridge",
+          revision: "claude-browser-bridge",
           userAgent: identity?.userAgent ?? "unknown",
           jsVersion: "",
         });
@@ -855,16 +855,23 @@ export class ExtensionRelayBridge {
           ...(owner.groupId !== null ? { groupId: owner.groupId } : {}),
           title: owner.title,
           color: owner.color,
-        })) as { tabId?: unknown; groupId?: unknown } | null;
+        })) as { tabId?: unknown; groupId?: unknown; targetId?: unknown } | null;
         if (typeof created?.tabId !== "number" || typeof created?.groupId !== "number") {
           this.respondError(client, request, "extension did not return a tabId and groupId for createTab");
           return;
         }
         const tabId = created.tabId;
         owner.groupId = created.groupId;
+        // The pipe driver returns the real targetId so the trusted backend can attach at once; the
+        // Chrome extension omits it and the attach command resolves it instead.
+        const createdTargetId = typeof created.targetId === "string" ? created.targetId : undefined;
         const existing = this.tabs.get(tabId);
-        if (existing) existing.info.groupId = created.groupId;
-        else this.tabs.set(tabId, { info: { tabId, url, title: "", active: false, groupId: created.groupId } });
+        if (existing) {
+          existing.info.groupId = created.groupId;
+          if (createdTargetId) existing.info.targetId = createdTargetId;
+        } else {
+          this.tabs.set(tabId, { info: { tabId, url, title: "", active: false, groupId: created.groupId, ...(createdTargetId ? { targetId: createdTargetId } : {}) } });
+        }
         const attached = await this.ensureTabAttached(tabId);
         // Announce before responding, mirroring Chrome's event-then-result order.
         this.announceAttachedTab(tabId, attached.targetId, attached.sessionId, client);

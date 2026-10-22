@@ -17,7 +17,8 @@ import type { Duplex } from "node:stream";
 import { type RawData, type WebSocket, WebSocketServer } from "ws";
 import { createLogger } from "./log.ts";
 import { ChromePipe } from "./pipe.ts";
-import { profileDirForName, profileNameForEmail } from "./profiles.ts";
+import { drivePipeProfile } from "./pipe-driver.ts";
+import { chromeDir, chromeEmails, profileDirForName, profileNameForEmail } from "./profiles.ts";
 import { type CdpExecBackend, ExtensionRelayBridge } from "./relay-bridge.ts";
 import { parseExtensionMessage } from "./relay-protocol.ts";
 
@@ -100,7 +101,12 @@ export type DaemonOptions = {
    * giving a fully trusted connection that reaches every domain. The extension still does identity,
    * groups and tab lifecycle; the pipe runs the CDP. Omit for the extension-only (chrome.debugger) path.
    */
-  pipe?: { chromeBinary: string; userDataDir: string; extraArgs?: string[] };
+  /** Full-CDP mode. With socketPath the daemon talks to a running holder (src/holder.ts) instead of
+   *  launching Chrome itself, so it can restart without closing the browser. */
+  pipe?: { chromeBinary: string; userDataDir: string; extraArgs?: string[]; socketPath?: string };
+  /** Holder mode: the connection to Chrome went away (Chrome closed). The entrypoint exits so
+   *  launchd restarts the daemon fresh; tests leave it unset. */
+  onPipeLost?: () => void;
 };
 
 type Registry = Map<string, { bridge: ExtensionRelayBridge; tabId: number }>;
@@ -147,20 +153,127 @@ export async function startDaemon(opts: DaemonOptions) {
   // their events are dropped here (page-level domains, the ones Chrome blocks the extension from,
   // all ride the page session).
   const targetRegistry = new Map<string, { bridge: ExtensionRelayBridge; tabId: number }>();
+  const drivers = new Map<string, ReturnType<typeof drivePipeProfile>>();
+  const ensuring = new Map<string, Promise<void>>();
   let pipe: ChromePipe | null = null;
   if (opts.pipe) {
     pipe = new ChromePipe({
       chromeBinary: opts.pipe.chromeBinary,
       userDataDir: opts.pipe.userDataDir,
       extraArgs: opts.pipe.extraArgs,
+      socketPath: opts.pipe.socketPath,
       onEvent: ({ targetId, method, params }) => {
         const entry = targetRegistry.get(targetId);
         if (entry) entry.bridge.injectCdpEvent(entry.tabId, undefined, method, params);
       },
-      onExit: () => log.warn("pipe Chrome exited; the daemon will relaunch it on the next launchd restart"),
+      onTargetEvent: (e) => {
+        for (const d of drivers.values()) d.onTargetEvent(e);
+      },
+      onExit: () => {
+        log.warn("lost Chrome; launchd restarts the daemon, which reconnects");
+        opts.onPipeLost?.();
+      },
     });
     await pipe.start();
   }
+
+  // contextId -> its profile dir once known. Positive cache only: a failed read (context busy, a
+  // tab-creation race) is transient and must never be remembered as "not a profile", or that context
+  // is skipped forever. `contextTries` bounds re-reads so a genuine non-profile context stops churning.
+  const contextDirs = new Map<string, string>();
+  const contextTries = new Map<string, number>();
+
+  /** The profile directory of one browser context, read once from chrome://version over the pipe. */
+  const profileDirOfContext = async (contextId: string): Promise<string | null> => {
+    if (!pipe) return null;
+    const known = contextDirs.get(contextId);
+    if (known) return known;
+    if ((contextTries.get(contextId) ?? 0) >= 4) return null; // genuine non-profile; stop re-reading
+    contextTries.set(contextId, (contextTries.get(contextId) ?? 0) + 1);
+    let targetId: string;
+    try {
+      ({ targetId } = (await pipe.send("Target.createTarget", { url: "chrome://version/", browserContextId: contextId })) as { targetId: string });
+    } catch {
+      return null; // transient (e.g. "Failed to find browser context"); retried next pass
+    }
+    try {
+      const sid = await pipe.attach(targetId);
+      await pipe.send("Page.enable", {}, sid).catch(() => {});
+      let dir: string | null = null;
+      for (let i = 0; i < 12 && !dir; i++) {
+        await new Promise((r) => setTimeout(r, 250));
+        const rv = (await pipe.send("Runtime.evaluate", { expression: "document.getElementById('profile_path')?.textContent||''", returnByValue: true }, sid).catch(() => null)) as { result?: { value?: string } } | null;
+        dir = (rv?.result?.value ?? "").trim() || null;
+      }
+      if (dir) contextDirs.set(contextId, dir);
+      return dir;
+    } catch {
+      return null;
+    } finally {
+      await pipe.send("Target.closeTarget", { targetId }).catch(() => {});
+    }
+  };
+
+  /** Context ids that currently hold a page, newest discovery first. */
+  const openContexts = async (): Promise<string[]> => {
+    if (!pipe) return [];
+    const pages = await pipe.pageTargets();
+    return [...new Set(pages.map((p) => p.browserContextId).filter((c): c is string => !!c))];
+  };
+
+  /** Ensure a bridge + pipe driver exist for a profile; open the profile if it has no window yet. Deduped. */
+  const ensurePipeProfile = async (name: string): Promise<void> => {
+    if (!pipe) return;
+    const existing = drivers.get(name);
+    if (existing) {
+      // Chrome unloads a profile once its last window closes; its context id dies with it.
+      if ((await openContexts()).includes(existing.contextId)) return;
+      log.info(`${name}: its profile closed since the last chat; reopening`);
+      existing.dispose();
+      drivers.delete(name);
+    }
+    let inflight = ensuring.get(name);
+    if (!inflight) {
+      inflight = buildPipeProfile(name).finally(() => ensuring.delete(name));
+      ensuring.set(name, inflight);
+    }
+    return inflight;
+  };
+
+  const buildPipeProfile = async (name: string): Promise<void> => {
+    if (!pipe || drivers.has(name)) return;
+    const wantDir = profileDirForName(name, env);
+    if (!wantDir) throw new Error(`${name}: no Chrome profile directory mapped (profiles.json)`);
+    const wantPath = `${chromeDir(env)}/${wantDir}`;
+    const find = async (): Promise<string | null> => {
+      const ctxs = await openContexts();
+      const seen: string[] = [];
+      for (const ctx of ctxs) {
+        const dir = await profileDirOfContext(ctx);
+        seen.push(`${ctx.slice(0, 6)}=${dir ? dir.split("/").pop() : "·"}`);
+        if (dir && (dir === wantPath || dir.endsWith(`/${wantDir}`))) return ctx;
+      }
+      if (env.CBB_DEBUG_FIND) log.info(`${name}: want "${wantDir}" among [${seen.join(", ")}]`);
+      return null;
+    };
+    let ctx = await find();
+    const launched = !ctx;
+    if (!ctx) {
+      log.info(`${name}: opening profile "${wantDir}" for a full-CDP chat`);
+      spawn(opts.pipe?.chromeBinary ?? CHROME_BIN, [`--user-data-dir=${opts.pipe?.userDataDir}`, `--profile-directory=${wantDir}`], { detached: true, stdio: "ignore" }).unref();
+      for (let i = 0; i < 40 && !ctx; i++) { await new Promise((r) => setTimeout(r, 500)); ctx = await find(); }
+    }
+    if (!ctx) throw new Error(`${name}: could not find or open its profile window`);
+    const email = chromeEmails(env).get(wantDir) ?? `${name}@profile.local`;
+    const bridge = bridgeFor(name);
+    const strayNewTabs = launched
+      ? (await pipe.pageTargets()).filter((p) => p.browserContextId === ctx && /^chrome:\/\/new-?tab/.test(p.url)).map((p) => p.targetId)
+      : [];
+    const driver = drivePipeProfile({ bridge, pipe, contextId: ctx, email, browserVersion: "Chrome", strayNewTabs });
+    drivers.set(name, driver);
+    await driver.ready; // the bridge has the profile's tabs + identity before the client talks
+    log.info(`${name}: full-CDP driver ready (context ${ctx.slice(0, 8)}, ${email})`);
+  };
 
   const openProfile =
     opts.openProfile ??
@@ -235,6 +348,9 @@ export async function startDaemon(opts: DaemonOptions) {
 
     if (url.pathname === "/ext") {
       if (origin !== extensionOrigin) return refuse(socket, "403 Forbidden");
+      // Full-CDP mode drives every profile through the pipe driver. A leftover installed extension
+      // would replace that driver as the profile's tab source and hand out tabs without targetIds.
+      if (pipe) return refuse(socket, "409 Conflict");
       wss.handleUpgrade(req, socket, head, (ws) => {
         let handlers: { onMessage: (raw: string) => void; onClose: () => void } | null = null;
         ws.on("message", (data) => {
@@ -263,12 +379,23 @@ export async function startDaemon(opts: DaemonOptions) {
       if (origin) return refuse(socket, "403 Forbidden");
       const name = cdp[1];
       if (!bridges.has(name) && !profileDirForName(name, env)) return refuse(socket, "404 Not Found");
-      wss.handleUpgrade(req, socket, head, (ws) => {
-        const handlers = bridgeFor(name).attachCdpClientSocket(bridgeSocket(ws), { key: url.searchParams.get("client") ?? undefined });
-        ws.on("message", (data) => handlers.onMessage(decode(data)));
-        ws.on("close", handlers.onClose);
-        ws.on("error", (err) => log.warn(`cdp socket: ${String(err)}`));
-      });
+      const accept = () =>
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          const handlers = bridgeFor(name).attachCdpClientSocket(bridgeSocket(ws), { key: url.searchParams.get("client") ?? undefined });
+          ws.on("message", (data) => handlers.onMessage(decode(data)));
+          ws.on("close", handlers.onClose);
+          ws.on("error", (err) => log.warn(`cdp socket: ${String(err)}`));
+        });
+      // Full-CDP mode: finish the profile's pipe driver BEFORE upgrading, so no opening CDP
+      // command from the client is dropped while setup is still running.
+      if (pipe) {
+        ensurePipeProfile(name).then(accept, (err) => {
+          log.warn(`${name}: ${String(err)}`);
+          refuse(socket, "500 Internal Server Error");
+        });
+      } else {
+        accept();
+      }
       return;
     }
     refuse(socket, "404 Not Found");
@@ -285,6 +412,8 @@ export async function startDaemon(opts: DaemonOptions) {
   return {
     port,
     bridges,
+    /** Chats connected right now, across every profile; the self-update waits for zero. */
+    cdpClients: () => [...bridges.values()].reduce((n, b) => n + b.cdpClientCount, 0),
     close: async () => {
       for (const bridge of bridges.values()) bridge.dispose();
       pipe?.stop();
@@ -295,22 +424,37 @@ export async function startDaemon(opts: DaemonOptions) {
 }
 
 if (import.meta.main) {
-  const home = process.env.CBB_HOME || path.join(process.env.HOME ?? "", ".chrome-profile-bridge");
+  const home = process.env.CBB_HOME || path.join(process.env.HOME ?? "", ".claude-browser-bridge");
   const extensionDir = process.env.CBB_EXTENSION_DIR || path.join(home, "extension");
-  // CBB_CHROME_UDD set => full-CDP mode: the daemon owns Chrome with the pipe, and auto-loads the
-  // extension so no profile needs a manual Load unpacked.
+  // CBB_CHROME_UDD set => full-CDP mode: every profile is driven over the trusted pipe, no
+  // extension. CBB_CHROME_SOCKET set too => the holder owns Chrome and this daemon connects to it.
   const udd = process.env.CBB_CHROME_UDD;
-  await startDaemon({
+  const daemon = await startDaemon({
     port: Number(process.env.CBB_PORT) || DEFAULT_PORT,
     extensionDir,
+    onPipeLost: () => process.exit(1),
     ...(udd
       ? {
           pipe: {
             chromeBinary: process.env.CBB_CHROME_BIN || CHROME_BIN,
             userDataDir: udd,
-            extraArgs: [`--load-extension=${extensionDir}`, ...(process.env.CBB_CHROME_EXTRA ? process.env.CBB_CHROME_EXTRA.split(" ") : [])],
+            extraArgs: process.env.CBB_CHROME_EXTRA ? process.env.CBB_CHROME_EXTRA.split(" ") : [],
+            socketPath: process.env.CBB_CHROME_SOCKET,
           },
         }
       : {}),
   });
+
+  // Self-update: the repo's post-commit hook copies new code into the app dir and writes VERSION.
+  // Once no chat is connected, exit; launchd restarts the daemon on the new code. In holder mode
+  // Chrome stays open throughout.
+  const versionFile = path.join(path.dirname(import.meta.dirname), "VERSION");
+  const readVersion = () => { try { return fs.readFileSync(versionFile, "utf8").trim(); } catch { return ""; } };
+  const running = readVersion();
+  setInterval(() => {
+    const next = readVersion();
+    if (!next || next === running || daemon.cdpClients() > 0) return;
+    log.info(`new code ${next.slice(0, 7)} (running ${running.slice(0, 7) || "unversioned"}); restarting while idle`);
+    process.exit(0);
+  }, 30_000).unref();
 }
