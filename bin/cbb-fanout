@@ -1,0 +1,29 @@
+#!/usr/bin/env node
+// Run one snippet across several profiles through the daemon, results as JSON.
+//
+//   cbb-fanout pw-1530 pw-aubit --url https://example.com -- "document.title"
+//   cbb-fanout pw-a pw-b -- "location.href"
+//
+// Names come before `--`; the in-page expression comes after. --url navigates first.
+import { fanout } from "../src/fanout.ts";
+
+const argv = process.argv.slice(2);
+const sep = argv.indexOf("--");
+if (sep < 0) {
+  console.error('usage: cbb-fanout <name...> [--url <url>] -- "<in-page expression>"');
+  process.exit(2);
+}
+const head = argv.slice(0, sep);
+const expression = argv.slice(sep + 1).join(" ");
+let url;
+const names = [];
+for (let i = 0; i < head.length; i++) {
+  if (head[i] === "--url") url = head[++i];
+  else names.push(head[i]);
+}
+if (!names.length || !expression) {
+  console.error('usage: cbb-fanout <name...> [--url <url>] -- "<in-page expression>"');
+  process.exit(2);
+}
+const results = await fanout({ names, expression, url, port: Number(process.env.CBB_PORT) || 18765 });
+console.log(JSON.stringify(results, null, 2));

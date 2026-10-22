@@ -29,6 +29,10 @@ export async function startStack() {
       res.writeHead(200, { "Content-Type": "application/json" }).end('{"ok":true}');
       return;
     }
+    if (req.url === "/download") {
+      res.writeHead(200, { "Content-Type": "text/plain", "Content-Disposition": 'attachment; filename="f.txt"' }).end("bridge download");
+      return;
+    }
     res.writeHead(200, { "Content-Type": "text/html", "Set-Cookie": "sid=abc123; Path=/" });
     res.end(`<title>Bridge test</title><button onclick="fetch('/api').then(r=>r.json()).then(j=>document.body.dataset.api=j.ok)">Go</button>`);
   });
@@ -51,11 +55,16 @@ export async function startStack() {
   });
 
   const opened: string[] = [];
+  const notifications: string[] = [];
+  const secretStore = new Map<string, string>();
   const daemon = await startDaemon({
     port: 0,
     extensionDir,
     env: { ...process.env, CBB_HOME: home, CBB_CHROME_DIR: path.join(home, "chrome") },
     openProfile: (dir) => opened.push(dir),
+    notify: (m) => notifications.push(m),
+    secretSource: async (service, account) => secretStore.get(`${service}:${account}`) ?? `secret-${account}`,
+    secretSink: async (service, account, value) => { secretStore.set(`${service}:${account}`, value); return true; },
     extensionWaitMs: 3000,
   });
   const ext = await startCdpExtension({ daemonPort: daemon.port, origin, browserWs, email: "Tester@Example.com" });
@@ -66,6 +75,7 @@ export async function startStack() {
     daemon,
     siteUrl,
     opened,
+    notifications,
     cdpUrl: (client: string, profile = "pw-test") => `ws://127.0.0.1:${daemon.port}/cdp/${profile}?client=${client}`,
     close: async () => {
       ext.close();

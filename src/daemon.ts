@@ -18,7 +18,7 @@ import { type RawData, type WebSocket, WebSocketServer } from "ws";
 import { createLogger } from "./log.ts";
 import { ChromePipe } from "./pipe.ts";
 import { drivePipeProfile } from "./pipe-driver.ts";
-import { chromeDir, chromeEmails, profileDirForName, profileNameForEmail } from "./profiles.ts";
+import { bridgeHome, chromeDir, chromeEmails, profileDirForName, profileNameForEmail } from "./profiles.ts";
 import { type CdpExecBackend, ExtensionRelayBridge } from "./relay-bridge.ts";
 import { parseExtensionMessage } from "./relay-protocol.ts";
 
@@ -96,6 +96,12 @@ export type DaemonOptions = {
   openProfile?: (dir: string) => void;
   extensionWaitMs?: number;
   endedGroupTtlMs?: number;
+  /** Override the Bridge.requestHuman ping (defaults to running CBB_NOTIFY_CMD); tests pass a recorder. */
+  notify?: (message: string) => void;
+  /** Override the Bridge.typeSecret source (defaults to macOS Keychain); tests pass a mock. */
+  secretSource?: (service: string, account: string) => Promise<string | null>;
+  /** Override the Bridge.saveSecret sink (defaults to macOS Keychain); tests pass a mock. */
+  secretSink?: (service: string, account: string, value: string) => Promise<boolean>;
   /**
    * Full-CDP mode: one Chrome launched with --remote-debugging-pipe on a non-default user-data-dir,
    * giving a fully trusted connection that reaches every domain. The extension still does identity,
@@ -308,6 +314,35 @@ export async function startDaemon(opts: DaemonOptions) {
         name,
         extensionWaitMs: opts.extensionWaitMs,
         endedGroupTtlMs: opts.endedGroupTtlMs,
+        timelineDir: path.join(bridgeHome(env), "timeline"),
+        notify:
+          opts.notify ??
+          ((message: string) => {
+            // The agent is stuck on a captcha/login and asked for you. Run CBB_NOTIFY_CMD with the
+            // message so you can wire any notifier (a script, a desktop toast); no-op if unset.
+            const cmd = process.env.CBB_NOTIFY_CMD;
+            if (cmd) spawn(cmd, [message], { shell: true, detached: true, stdio: "ignore" }).unref();
+          }),
+        secretSource:
+          opts.secretSource ??
+          ((service: string, account: string) =>
+            // macOS Keychain; -w prints only the password. Never logged.
+            new Promise<string | null>((resolve) => {
+              const p = spawn("/usr/bin/security", ["find-generic-password", "-s", service, "-a", account, "-w"], { stdio: ["ignore", "pipe", "ignore"] });
+              let out = "";
+              p.stdout.on("data", (d) => (out += d));
+              p.on("close", (code) => resolve(code === 0 ? out.replace(/\n$/, "") : null));
+              p.on("error", () => resolve(null));
+            })),
+        secretSink:
+          opts.secretSink ??
+          ((service: string, account: string, value: string) =>
+            new Promise<boolean>((resolve) => {
+              // -U updates an existing item; -w takes the password so it is not in the arg list of ps.
+              const p = spawn("/usr/bin/security", ["add-generic-password", "-s", service, "-a", account, "-U", "-w", value], { stdio: "ignore" });
+              p.on("close", (code) => resolve(code === 0));
+              p.on("error", () => resolve(false));
+            })),
         onStateChange: () => maybeUpdate(name),
         onNeedExtension: () => {
           const dir = profileDirForName(name, env);

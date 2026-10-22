@@ -9,6 +9,8 @@
  * Adapted from OpenClaw's extension relay (MIT, third_party/OPENCLAW-LICENSE).
  */
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { createLogger } from "./log.ts";
 import {
   type ExtensionToRelayMessage,
@@ -72,7 +74,82 @@ type Owner = {
   groupId: number | null;
   client: CdpClientState | null;
   closeTimer: NodeJS.Timeout | null;
+  /** Fast-load: URL patterns blocked on every tab of this chat (Bridge.setFastLoad), or null. */
+  fastLoad: string[] | null;
+  /** Last lean snapshot this chat took, for Bridge.snapshot{diff}. */
+  lastSnapshot: LeanNode[] | null;
+  /** Recent network requests on this chat's tabs (Bridge.har), newest last, capped. */
+  har: HarEntry[];
+  /** Where this chat's downloads land (Bridge.setDownloadDir), or null. */
+  downloadDir: string | null;
+  /** A flow being recorded (Bridge.record), or null. Replayed deterministically by role+name. */
+  recording: { name: string; steps: FlowStep[] } | null;
 };
+
+type FlowStep = { type: "navigate"; url: string } | { type: "act"; action: string; text?: string; role?: string; name?: string };
+
+type HarEntry = { requestId: string; method: string; url: string; type?: string; status: number | null; mimeType?: string; ts: number };
+const HAR_CAP = 500;
+
+/** One interactive element in a lean snapshot. `id` is the backend DOM node id for later action. */
+export type LeanNode = { id: number; role: string; name: string; value?: string };
+
+/** A profile is "signed in" when it reports a real account email, not the no-account placeholder. */
+export function isSignedIn(email: string | undefined | null): boolean {
+  return !!email && email.includes("@") && !email.endsWith("@profile.local");
+}
+
+const INTERACTIVE_ROLES = new Set([
+  "button", "link", "textbox", "searchbox", "combobox", "checkbox", "radio", "menuitem",
+  "menuitemcheckbox", "menuitemradio", "tab", "switch", "slider", "option", "textarea", "spinbutton",
+]);
+
+type AxNode = { ignored?: boolean; role?: { value?: string }; name?: { value?: string }; value?: { value?: string }; backendDOMNodeId?: number };
+
+/** Keep only named interactive elements from a full AX tree, the part an agent acts on. */
+export function leanAxNodes(nodes: AxNode[]): LeanNode[] {
+  const out: LeanNode[] = [];
+  for (const n of nodes) {
+    if (n.ignored) continue;
+    const role = n.role?.value ?? "";
+    const name = (n.name?.value ?? "").trim();
+    if (!INTERACTIVE_ROLES.has(role) || !name || typeof n.backendDOMNodeId !== "number") continue;
+    const value = n.value?.value;
+    out.push({ id: n.backendDOMNodeId, role, name, ...(value ? { value: String(value) } : {}) });
+  }
+  return out;
+}
+
+/** What changed between two lean snapshots, keyed by DOM node id. */
+export function diffSnapshots(prev: LeanNode[], next: LeanNode[]): { added: LeanNode[]; removed: LeanNode[]; changed: LeanNode[] } {
+  const prevById = new Map(prev.map((n) => [n.id, n]));
+  const nextIds = new Set(next.map((n) => n.id));
+  const added: LeanNode[] = [];
+  const changed: LeanNode[] = [];
+  for (const n of next) {
+    const was = prevById.get(n.id);
+    if (!was) added.push(n);
+    else if (was.name !== n.name || was.value !== n.value || was.role !== n.role) changed.push(n);
+  }
+  return { added, removed: prev.filter((n) => !nextIds.has(n.id)), changed };
+}
+
+/** Block-pattern groups for Bridge.setFastLoad; an agent asks for groups, not raw patterns. */
+const FAST_LOAD_PATTERNS: Record<string, string[]> = {
+  image: ["*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.ico", "*.bmp", "*.avif"],
+  font: ["*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot"],
+  media: ["*.mp4", "*.webm", "*.mp3", "*.m4a", "*.mov", "*.ogg"],
+  ads: ["*doubleclick.net*", "*googlesyndication*", "*google-analytics*", "*googletagmanager*", "*adservice*", "*scorecardresearch*", "*/ads/*", "*facebook.com/tr*"],
+};
+
+/** Turn a Bridge.setFastLoad request into a de-duplicated URL-pattern list. */
+export function fastLoadPatterns(params: { groups?: unknown; urls?: unknown }): string[] {
+  const groups = Array.isArray(params.groups) ? params.groups : ["image", "font", "media", "ads"];
+  const out = new Set<string>();
+  for (const g of groups) for (const p of FAST_LOAD_PATTERNS[String(g)] ?? []) out.add(p);
+  if (Array.isArray(params.urls)) for (const u of params.urls) if (typeof u === "string") out.add(u);
+  return [...out];
+}
 
 type CdpClientState = {
   socket: BridgeSocket;
@@ -104,6 +181,14 @@ export type BridgeOptions = {
   onNeedExtension?: () => void;
   extensionWaitMs?: number;
   endedGroupTtlMs?: number;
+  /** Where Bridge.timelineCapture writes per-chat screenshots + a log; unset disables the timeline. */
+  timelineDir?: string;
+  /** Ping the user (Bridge.requestHuman). The daemon wires this to CBB_NOTIFY_CMD; tests pass a mock. */
+  notify?: (message: string) => void;
+  /** Fetch a secret for Bridge.typeSecret. The daemon reads macOS Keychain; the value never leaves here. */
+  secretSource?: (service: string, account: string) => Promise<string | null>;
+  /** Store a secret for Bridge.saveSecret. The daemon writes macOS Keychain. */
+  secretSink?: (service: string, account: string, value: string) => Promise<boolean>;
 };
 
 /**
@@ -207,8 +292,11 @@ export class ExtensionRelayBridge {
 
   /** Per-chat view for /status. */
   status() {
+    const email = this.extension?.identity?.email ?? null;
     return {
       extension: this.extension?.identity ?? null,
+      email,
+      signedIn: isSignedIn(email),
       chats: [...this.owners.values()].map((owner) => ({
         key: owner.key,
         connected: owner.client !== null,
@@ -363,7 +451,7 @@ export class ExtensionRelayBridge {
 
   private sendToExtension(msg: RelayToExtensionMessage): void {
     if (!this.extension) {
-      throw new Error(`${this.opts.name ?? "this profile"}: the Claude Browser Bridge extension is not connected`);
+      throw new Error(`${this.opts.name ?? "this profile"}: the Chrome Profile Bridge extension is not connected`);
     }
     this.extension.socket.send(JSON.stringify(msg));
   }
@@ -478,6 +566,7 @@ export class ExtensionRelayBridge {
         throw new Error(`tab ${tabId} closed during attach`);
       }
       tab.attached = attached;
+      void this.applyFastLoad(tabId); // new tab joins this chat's fast-load block list, if any
       return attached;
     })();
     tab.attaching = attaching;
@@ -486,6 +575,100 @@ export class ExtensionRelayBridge {
     } finally {
       tab.attaching = undefined;
     }
+  }
+
+  /** Record a network request/response on the owning chat's HAR log (capped). */
+  private recordHar(tabId: number, method: string, params: unknown): void {
+    const groupId = this.tabs.get(tabId)?.info.groupId;
+    const owner = typeof groupId === "number" ? this.ownerOfGroup(groupId) : undefined;
+    if (!owner) return;
+    const p = params as { requestId?: string; request?: { method?: string; url?: string }; response?: { url?: string; status?: number; mimeType?: string }; type?: string };
+    if (!p.requestId) return;
+    if (method === "Network.requestWillBeSent") {
+      owner.har.push({ requestId: p.requestId, method: p.request?.method ?? "", url: p.request?.url ?? "", type: p.type, status: null, ts: Date.now() });
+      if (owner.har.length > HAR_CAP) owner.har.shift();
+    } else {
+      const entry = [...owner.har].reverse().find((e) => e.requestId === p.requestId);
+      if (entry) { entry.status = p.response?.status ?? null; entry.mimeType = p.response?.mimeType; }
+    }
+  }
+
+  /** Screenshot the chat's active tab and append a numbered timeline entry; null if disabled. */
+  private async captureTimeline(client: CdpClientState, label: string): Promise<{ n: number; url: string } | null> {
+    if (!this.opts.timelineDir) return null;
+    const dir = path.join(this.opts.timelineDir, client.owner.key.replace(/[^a-z0-9_-]/gi, "-"));
+    const logPath = path.join(dir, "log.jsonl");
+    const tabId = await this.anyTabOf(client).catch(() => null);
+    if (tabId === null) return null;
+    let n = 1;
+    try { n = fs.readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean).length + 1; } catch {} // restart-safe
+    fs.mkdirSync(dir, { recursive: true });
+    const shot = (await this.execCdp(tabId, undefined, "Page.captureScreenshot", { format: "png" }).catch(() => null)) as { data?: string } | null;
+    if (shot?.data) fs.writeFileSync(path.join(dir, `${String(n).padStart(3, "0")}.png`), Buffer.from(shot.data, "base64"));
+    const urlRes = (await this.execCdp(tabId, undefined, "Runtime.evaluate", { expression: "location.href", returnByValue: true }).catch(() => null)) as { result?: { value?: string } } | null;
+    const url = urlRes?.result?.value ?? "";
+    fs.appendFileSync(logPath, `${JSON.stringify({ n, ts: Date.now(), label, url, screenshot: shot?.data ? `${String(n).padStart(3, "0")}.png` : null })}\n`);
+    return { n, url };
+  }
+
+  /** Scroll an element into view, wait until it has a box, act, and poll for a url/DOM change. */
+  private async performAct(tabId: number, id: number, action: string, text: string | undefined): Promise<{ changed: boolean; navigated: boolean; url: string }> {
+    const exec = (method: string, params?: unknown) => this.execCdp(tabId, undefined, method, params);
+    const read = async () =>
+      ((await exec("Runtime.evaluate", { expression: "location.href + '\\u0000' + document.documentElement.outerHTML.length", returnByValue: true })) as { result?: { value?: string } }).result?.value ?? "";
+    await exec("DOM.enable").catch(() => {});
+    await exec("DOM.scrollIntoViewIfNeeded", { backendNodeId: id }).catch(() => {});
+    const before = await read();
+    if (action === "type") {
+      await exec("DOM.focus", { backendNodeId: id });
+      await exec("Input.insertText", { text: String(text ?? "") });
+    } else {
+      let box: { model?: { content?: number[] } } | null = null;
+      for (let i = 0; i < 10 && !box?.model?.content; i++) {
+        box = (await exec("DOM.getBoxModel", { backendNodeId: id }).catch(() => null)) as typeof box;
+        if (!box?.model?.content) await new Promise((r) => setTimeout(r, 150));
+      }
+      const q = box?.model?.content;
+      if (!q) throw new Error(`element ${id} never became actionable (no box)`);
+      const cx = (q[0] + q[4]) / 2;
+      const cy = (q[1] + q[5]) / 2;
+      await exec("Input.dispatchMouseEvent", { type: "mouseMoved", x: cx, y: cy });
+      if (action !== "hover") {
+        await exec("Input.dispatchMouseEvent", { type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1 });
+        await exec("Input.dispatchMouseEvent", { type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1 });
+      }
+    }
+    let after = before;
+    for (let i = 0; i < 12 && after === before; i++) {
+      await new Promise((r) => setTimeout(r, 150));
+      after = await read();
+    }
+    const beforeUrl = before.split("\u0000")[0];
+    const afterUrl = after.split("\u0000")[0];
+    return { changed: after !== before, navigated: beforeUrl !== afterUrl, url: afterUrl };
+  }
+
+  /** The role+name of a snapshot id, from the chat's last snapshot, for recording a replayable step. */
+  private describeNode(owner: Owner, id: number): { role?: string; name?: string } {
+    const node = owner.lastSnapshot?.find((n) => n.id === id);
+    return node ? { role: node.role, name: node.name } : {};
+  }
+
+  /** A fresh lean snapshot of a tab, for replay to find an element by role+name. */
+  private async leanSnapshotOf(tabId: number): Promise<LeanNode[]> {
+    await this.execCdp(tabId, undefined, "Accessibility.enable").catch(() => {});
+    const { nodes } = (await this.execCdp(tabId, undefined, "Accessibility.getFullAXTree")) as { nodes: AxNode[] };
+    return leanAxNodes(nodes);
+  }
+
+  /** Apply the owning chat's fast-load block list (if any) to one attached tab. */
+  private async applyFastLoad(tabId: number): Promise<void> {
+    const tab = this.tabs.get(tabId);
+    const groupId = tab?.info.groupId;
+    const owner = typeof groupId === "number" ? this.ownerOfGroup(groupId) : undefined;
+    if (!owner?.fastLoad) return;
+    await this.execCdp(tabId, undefined, "Network.enable").catch(() => {});
+    await this.execCdp(tabId, undefined, "Network.setBlockedURLs", { urls: owner.fastLoad }).catch(() => {});
   }
 
   private targetInfoForTab(tab: TabState, targetId: string): Record<string, unknown> {
@@ -543,6 +726,7 @@ export class ExtensionRelayBridge {
   }
 
   private forwardExtensionEvent(tabId: number, childSessionId: string | undefined, method: string, params: unknown): void {
+    if (method === "Network.requestWillBeSent" || method === "Network.responseReceived") this.recordHar(tabId, method, params);
     const rootSessionId = this.tabs.get(tabId)?.attached?.sessionId;
     if (!rootSessionId) return;
     const sessionId = childSessionId ?? rootSessionId;
@@ -586,7 +770,7 @@ export class ExtensionRelayBridge {
     const key = opts.key?.trim() || `claude-${crypto.randomBytes(3).toString("hex")}`;
     let owner = this.owners.get(key);
     if (!owner) {
-      owner = { key, title: key, color: GROUP_COLORS[this.nextColor++ % GROUP_COLORS.length], groupId: null, client: null, closeTimer: null };
+      owner = { key, title: key, color: GROUP_COLORS[this.nextColor++ % GROUP_COLORS.length], groupId: null, client: null, closeTimer: null, fastLoad: null, lastSnapshot: null, har: [], downloadDir: null, recording: null };
       this.owners.set(key, owner);
     }
     if (owner.closeTimer) {
@@ -701,6 +885,16 @@ export class ExtensionRelayBridge {
   }
 
   private async handleSessionScopedRequest(client: CdpClientState, request: CdpRequest): Promise<void> {
+    // Bridge.* are the bridge's own methods, not Chrome's; serve them whether the agent calls them
+    // from a page session or a browser session, rather than forwarding them to the tab.
+    if (request.method.startsWith("Bridge.")) {
+      await this.handleBrowserScopedRequest(client, request);
+      return;
+    }
+    if (client.owner.recording && request.method === "Page.navigate") {
+      const url = (request.params as { url?: string } | undefined)?.url;
+      if (url) client.owner.recording.steps.push({ type: "navigate", url });
+    }
     const sessionId = request.sessionId as string;
     const route = this.tabForClientSession(client, sessionId);
     if (!route) {
@@ -755,7 +949,7 @@ export class ExtensionRelayBridge {
         const targetId = request.params?.targetId as string | undefined;
         if (!targetId || targetId === BROWSER_TARGET_ID) {
           this.respond(client, request, {
-            targetInfo: { targetId: BROWSER_TARGET_ID, type: "browser", title: "Claude Browser Bridge", url: "", attached: true, canAccessOpener: false },
+            targetInfo: { targetId: BROWSER_TARGET_ID, type: "browser", title: "Chrome Profile Bridge", url: "", attached: true, canAccessOpener: false },
           });
           return;
         }
@@ -914,8 +1108,275 @@ export class ExtensionRelayBridge {
         return;
       }
       case "Target.createBrowserContext":
-        this.respondError(client, request, "Claude Browser Bridge drives a real signed-in profile; isolated browser contexts are not supported.");
+        this.respondError(client, request, "Chrome Profile Bridge drives a real signed-in profile; isolated browser contexts are not supported.");
         return;
+      case "Bridge.setFastLoad": {
+        // Block images/fonts/media/ads (or custom url patterns) on every tab of this chat, so pages
+        // load faster and snapshots shrink. { groups?: ["image","font","media","ads"], urls?: [...] };
+        // empty groups and urls turns it off.
+        const patterns = fastLoadPatterns(request.params ?? {});
+        owner.fastLoad = patterns.length ? patterns : null;
+        const owned = [...this.tabs.keys()].filter((tabId) => this.ownsTab(client, tabId));
+        await Promise.all(
+          owned.map(async (tabId) => {
+            await this.ensureTabAttached(tabId);
+            await this.execCdp(tabId, undefined, "Network.enable").catch(() => {});
+            await this.execCdp(tabId, undefined, "Network.setBlockedURLs", { urls: patterns }).catch(() => {}); // empty clears
+          }),
+        );
+        this.respond(client, request, { blocked: patterns.length });
+        return;
+      }
+      case "Bridge.saveSecret": {
+        // Save a credential to the Keychain for later auto-fill. { service, account, value? }. With
+        // no value a strong one is generated and stored without the agent ever seeing it, so a
+        // sign-up can set a password the agent then types into the form with Bridge.typeSecret.
+        const service = String(request.params?.service ?? "");
+        const account = String(request.params?.account ?? "");
+        if (!service || !account) {
+          this.respondError(client, request, "service and account are required", -32602);
+          return;
+        }
+        if (!this.opts.secretSink) {
+          this.respondError(client, request, "secret sink not configured");
+          return;
+        }
+        const generated = typeof request.params?.value !== "string";
+        const value = generated ? crypto.randomBytes(18).toString("base64url") : String(request.params?.value);
+        const ok = await this.opts.secretSink(service, account, value).catch(() => false);
+        if (!ok) {
+          this.respondError(client, request, `could not save secret for service="${service}" account="${account}"`);
+          return;
+        }
+        this.respond(client, request, { saved: true, generated }); // never the value
+        return;
+      }
+      case "Bridge.typeSecret": {
+        // Type a secret from the Keychain into an element without the agent ever seeing the value.
+        // { id (from Bridge.snapshot), service, account }. The value is read here, typed over the
+        // pipe, and never returned or logged; the agent gets only { typed: true }.
+        const id = request.params?.id;
+        const service = String(request.params?.service ?? "");
+        const account = String(request.params?.account ?? "");
+        if (typeof id !== "number" || !service || !account) {
+          this.respondError(client, request, "id (number), service and account are required", -32602);
+          return;
+        }
+        if (!this.opts.secretSource) {
+          this.respondError(client, request, "secret source not configured");
+          return;
+        }
+        const secret = await this.opts.secretSource(service, account).catch(() => null);
+        if (!secret) {
+          this.respondError(client, request, `no secret for service="${service}" account="${account}"`); // never echoes a value
+          return;
+        }
+        const tabId = await this.anyTabOf(client);
+        await this.execCdp(tabId, undefined, "DOM.focus", { backendNodeId: id });
+        await this.execCdp(tabId, undefined, "Input.insertText", { text: secret });
+        this.respond(client, request, { typed: true });
+        return;
+      }
+      case "Bridge.requestHuman": {
+        // Last resort: the agent has TRIED the captcha / 2FA / login itself and is stuck. Ping the
+        // user once, then poll `until` (a JS expression that becomes true once they solve it) on the
+        // active tab until true or timeout, and resume. { reason, until?, timeoutMs? }.
+        const reason = String(request.params?.reason ?? "needs you");
+        const timeoutMs = Math.min(Number(request.params?.timeoutMs) || 180_000, 600_000);
+        const until = typeof request.params?.until === "string" ? request.params.until : null;
+        this.opts.notify?.(`Question: browser ${this.opts.name ?? "bridge"}: ${reason}`.slice(0, 94));
+        const start = Date.now();
+        let solved = false;
+        if (until) {
+          const tabId = await this.anyTabOf(client).catch(() => null);
+          while (tabId !== null && Date.now() - start < timeoutMs) {
+            await new Promise((r) => setTimeout(r, 500));
+            const r = (await this.execCdp(tabId, undefined, "Runtime.evaluate", { expression: until, returnByValue: true }).catch(() => null)) as { result?: { value?: unknown } } | null;
+            if (r?.result?.value) { solved = true; break; }
+          }
+          this.respond(client, request, { pinged: true, solved, waitedMs: Date.now() - start });
+        } else {
+          this.respond(client, request, { pinged: true, solved: false, note: "pinged; re-check the page yourself" });
+        }
+        return;
+      }
+      case "Bridge.har": {
+        // The network requests seen on this chat's tabs (method, url, status, type). { clear?: true }
+        // empties the log after returning it. Needs Network.enable on the tab, which Playwright does.
+        const entries = client.owner.har.slice();
+        if (request.params?.clear === true) client.owner.har.length = 0;
+        this.respond(client, request, { entries });
+        return;
+      }
+      case "Bridge.setDownloadDir": {
+        // Downloads from this chat's tabs land in a per-chat directory under the bridge home.
+        if (!this.opts.timelineDir) {
+          this.respond(client, request, { disabled: true });
+          return;
+        }
+        const dir = path.join(path.dirname(this.opts.timelineDir), "downloads", client.owner.key.replace(/[^a-z0-9_-]/gi, "-"));
+        fs.mkdirSync(dir, { recursive: true });
+        const tabId = await this.anyTabOf(client);
+        await this.execCdp(tabId, undefined, "Page.setDownloadBehavior", { behavior: "allow", downloadPath: dir }).catch(() => {});
+        client.owner.downloadDir = dir;
+        this.respond(client, request, { dir });
+        return;
+      }
+      case "Bridge.downloads": {
+        let files: string[] = [];
+        if (client.owner.downloadDir) {
+          try { files = fs.readdirSync(client.owner.downloadDir).filter((f) => !f.endsWith(".crdownload")); } catch {}
+        }
+        this.respond(client, request, { dir: client.owner.downloadDir, files });
+        return;
+      }
+      case "Bridge.health": {
+        // Is this profile usable right now? email + signedIn tell an agent to stop before it wastes
+        // a task on a logged-out profile. signedIn is false for a profile with no real account.
+        const email = this.identity?.email ?? null;
+        this.respond(client, request, { name: this.opts.name ?? null, email, signedIn: isSignedIn(email), browserVersion: this.identity?.browserVersion ?? null });
+        return;
+      }
+      case "Bridge.timelineCapture": {
+        // Screenshot + a numbered log line for this chat, under ~/.chrome-profile-bridge/timeline/.
+        const captured = await this.captureTimeline(client, String(request.params?.label ?? ""));
+        this.respond(client, request, captured ?? { disabled: true });
+        return;
+      }
+      case "Bridge.timeline": {
+        const entries: unknown[] = [];
+        if (this.opts.timelineDir) {
+          const logPath = path.join(this.opts.timelineDir, client.owner.key.replace(/[^a-z0-9_-]/gi, "-"), "log.jsonl");
+          try {
+            for (const line of fs.readFileSync(logPath, "utf8").trim().split("\n")) if (line) entries.push(JSON.parse(line));
+          } catch {}
+        }
+        this.respond(client, request, { entries });
+        return;
+      }
+      case "Bridge.act": {
+        // Act on an element by its Bridge.snapshot id (backend DOM node): scroll it into view, wait
+        // until it has a box, click/type/hover, then poll for a url or DOM change and report it.
+        // { id, action?: "click"|"type"|"hover", text? }. Kills "clicked a stale/hidden element".
+        const tabId = await this.anyTabOf(client);
+        const id = request.params?.id;
+        const action = (request.params?.action as string) ?? "click";
+        if (typeof id !== "number") {
+          this.respondError(client, request, "id (number) from Bridge.snapshot is required", -32602);
+          return;
+        }
+        let result: { changed: boolean; navigated: boolean; url: string };
+        try {
+          result = await this.performAct(tabId, id, action, request.params?.text as string | undefined);
+        } catch (err) {
+          this.respondError(client, request, `act failed: ${err instanceof Error ? err.message : String(err)}`);
+          return;
+        }
+        if (owner.recording) owner.recording.steps.push({ type: "act", action, text: request.params?.text as string | undefined, ...this.describeNode(owner, id) });
+        void this.captureTimeline(client, action).catch(() => {}); // auto-record the step
+        this.respond(client, request, result);
+        return;
+      }
+      case "Bridge.record": {
+        owner.recording = { name: String(request.params?.name ?? "flow"), steps: [] };
+        this.respond(client, request, { recording: owner.recording.name });
+        return;
+      }
+      case "Bridge.stopRecording": {
+        if (!owner.recording || !this.opts.timelineDir) {
+          this.respond(client, request, { saved: false });
+          return;
+        }
+        const dir = path.join(path.dirname(this.opts.timelineDir), "recordings");
+        fs.mkdirSync(dir, { recursive: true });
+        const file = path.join(dir, `${owner.recording.name.replace(/[^a-z0-9_-]/gi, "-")}.json`);
+        fs.writeFileSync(file, JSON.stringify(owner.recording.steps, null, 2));
+        const steps = owner.recording.steps.length;
+        owner.recording = null;
+        this.respond(client, request, { saved: true, steps, file });
+        return;
+      }
+      case "Bridge.replay": {
+        if (!this.opts.timelineDir) {
+          this.respondError(client, request, "recordings are disabled (no home dir)");
+          return;
+        }
+        const name = String(request.params?.name ?? "flow").replace(/[^a-z0-9_-]/gi, "-");
+        let steps: FlowStep[];
+        try {
+          steps = JSON.parse(fs.readFileSync(path.join(path.dirname(this.opts.timelineDir), "recordings", `${name}.json`), "utf8")) as FlowStep[];
+        } catch {
+          this.respondError(client, request, `no recording named "${name}"`);
+          return;
+        }
+        const tabId = await this.anyTabOf(client);
+        let done = 0;
+        for (const step of steps) {
+          if (step.type === "navigate") {
+            await this.execCdp(tabId, undefined, "Page.navigate", { url: step.url });
+            await new Promise((r) => setTimeout(r, 500));
+          } else {
+            const node = (await this.leanSnapshotOf(tabId)).find((n) => n.role === step.role && n.name === step.name);
+            if (!node) {
+              this.respondError(client, request, `replay stuck: no "${step.name}" (${step.role}) on the page after ${done} steps`);
+              return;
+            }
+            await this.performAct(tabId, node.id, step.action, step.text);
+          }
+          done++;
+        }
+        this.respond(client, request, { replayed: done });
+        return;
+      }
+      case "Bridge.snapshot": {
+        // A lean, interactive-only accessibility tree for this chat's active tab. { diff?: bool }
+        // returns only what changed since the chat's last Bridge.snapshot. Far smaller than a full
+        // page snapshot, so an agent spends fewer tokens per step.
+        const tabId = await this.anyTabOf(client);
+        await this.execCdp(tabId, undefined, "Accessibility.enable").catch(() => {});
+        const { nodes } = (await this.execCdp(tabId, undefined, "Accessibility.getFullAXTree")) as { nodes: AxNode[] };
+        const lean = leanAxNodes(nodes);
+        const prev = owner.lastSnapshot;
+        owner.lastSnapshot = lean;
+        if (request.params?.diff === true && prev) this.respond(client, request, diffSnapshots(prev, lean));
+        else this.respond(client, request, { nodes: lean });
+        return;
+      }
+      case "Bridge.extract": {
+        // Run an in-page expression and return its JSON value (awaits a promise), so an agent pulls
+        // structured data instead of reading a whole snapshot. { expression }.
+        const tabId = await this.anyTabOf(client);
+        const expression = String(request.params?.expression ?? "null");
+        const r = (await this.execCdp(tabId, undefined, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true })) as { result?: { value?: unknown }; exceptionDetails?: { exception?: { description?: string } } };
+        if (r.exceptionDetails) {
+          this.respondError(client, request, `extract threw: ${r.exceptionDetails.exception?.description ?? "error"}`);
+          return;
+        }
+        this.respond(client, request, { value: r.result?.value ?? null });
+        return;
+      }
+      case "Bridge.marks": {
+        // Screenshot-friendly list of this tab's interactive elements with click coordinates, for
+        // visual grounding when the AX names are thin. { screenshot?: true } adds a base64 png.
+        const tabId = await this.anyTabOf(client);
+        await this.execCdp(tabId, undefined, "Accessibility.enable").catch(() => {});
+        const { nodes } = (await this.execCdp(tabId, undefined, "Accessibility.getFullAXTree")) as { nodes: AxNode[] };
+        const marks: Array<{ n: number; id: number; role: string; name: string; x: number; y: number }> = [];
+        let n = 1;
+        for (const node of leanAxNodes(nodes)) {
+          const box = (await this.execCdp(tabId, undefined, "DOM.getBoxModel", { backendNodeId: node.id }).catch(() => null)) as { model?: { content?: number[] } } | null;
+          const q = box?.model?.content;
+          if (!q) continue;
+          marks.push({ n: n++, id: node.id, role: node.role, name: node.name, x: Math.round((q[0] + q[4]) / 2), y: Math.round((q[1] + q[5]) / 2) });
+        }
+        const out: Record<string, unknown> = { marks };
+        if (request.params?.screenshot === true) {
+          const shot = (await this.execCdp(tabId, undefined, "Page.captureScreenshot", { format: "png" }).catch(() => null)) as { data?: string } | null;
+          if (shot?.data) out.screenshot = shot.data;
+        }
+        this.respond(client, request, out);
+        return;
+      }
       case "Bridge.listAllTabs":
         this.respond(client, request, await this.callExtension({ type: "listAllTabs" }));
         return;

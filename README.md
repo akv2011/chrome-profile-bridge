@@ -35,6 +35,27 @@ daemon per machine that holds a single extension socket per profile and serves C
 - Adopt or release one of your own tabs through a browser session: `Bridge.listAllTabs`,
   `Bridge.adoptTab { tabId }`, `Bridge.releaseTab { tabId }`.
 
+## Agent methods (`Bridge.*`)
+
+Call these over the page's CDP session (`page.context().newCDPSession(page).send("Bridge.x", …)`). They add the agent layer on top of raw CDP:
+
+| Method | What it does |
+|---|---|
+| `Bridge.snapshot { diff? }` | Interactive-only accessibility tree (role, name, value, id). `diff` returns only what changed since the last call. Small, so a step costs fewer tokens. |
+| `Bridge.act { id, action, text? }` | Scroll an element in, wait until it's actionable, click/type/hover, then poll and report `{ changed, navigated, url }`. |
+| `Bridge.marks { screenshot? }` | Interactive elements with click coordinates, for visual grounding when names are thin. |
+| `Bridge.extract { expression }` | Run an in-page expression and return its JSON value. |
+| `Bridge.setFastLoad { groups?, urls? }` | Block images/fonts/media/ads (or custom patterns) on this chat's tabs. Faster loads, smaller snapshots. |
+| `Bridge.har { clear? }` | The network requests on this chat's tabs (method, url, status, type). |
+| `Bridge.setDownloadDir` / `Bridge.downloads` | Point downloads at a per-chat directory and list what landed. |
+| `Bridge.timelineCapture { label }` / `Bridge.timeline` | A numbered screenshot + log per step, so a run can be reviewed. `Bridge.act` records automatically. |
+| `Bridge.health` | `{ name, email, signedIn }` so an agent stops before using a logged-out profile. |
+| `Bridge.requestHuman { reason, until?, timeoutMs? }` | Last resort after the agent tries a captcha/2FA/login itself: ping the user once (`CBB_NOTIFY_CMD`), poll `until` until solved, resume. |
+| `Bridge.saveSecret { service, account, value? }` / `Bridge.typeSecret { id, service, account }` | Save a credential (or generate one the agent never sees) and type it into a field, for sign-up and auto-fill. The value never crosses the wire. |
+| `Bridge.record { name }` / `Bridge.stopRecording` / `Bridge.replay { name }` | Capture a flow (navigations + acts by role+name) and rerun it deterministically. |
+
+Across profiles: `bin/cbb-fanout <name…> [--url <url>] -- "<expression>"` runs one snippet on several profiles at once and prints one result each.
+
 ## Two modes
 
 - **Full-CDP (recommended), no extension.** A tiny holder owns Chrome over

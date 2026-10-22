@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ExtensionRelayBridge, type BridgeOptions, type BridgeSocket } from "./relay-bridge.ts";
+import { ExtensionRelayBridge, isSignedIn, type BridgeOptions, type BridgeSocket } from "./relay-bridge.ts";
 import type { ExtensionToRelayMessage, RelayTabInfo, RelayToExtensionMessage } from "./relay-protocol.ts";
 
 type Frame = Record<string, unknown>;
@@ -339,5 +339,14 @@ describe("ExtensionRelayBridge", () => {
     bridge.attachExtensionSocket(socket).onMessage(JSON.stringify({ type: "tabs", tabs: [] }));
     expect(socket.closed).toBe(true);
     expect(bridge.extensionConnected).toBe(false);
+  });
+});
+
+describe("isSignedIn", () => {
+  it("is true for a real account, false for the no-account placeholder", () => {
+    expect(isSignedIn("you@example.com")).toBe(true);
+    expect(isSignedIn("pw-test@profile.local")).toBe(false);
+    expect(isSignedIn("")).toBe(false);
+    expect(isSignedIn(null)).toBe(false);
   });
 });
