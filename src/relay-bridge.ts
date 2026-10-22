@@ -501,7 +501,9 @@ export class ExtensionRelayBridge {
   private syncTabs(next: RelayTabInfo[]): void {
     const nextIds = new Set(next.map((tab) => tab.tabId));
     for (const tabId of [...this.tabs.keys()]) {
-      if (!nextIds.has(tabId)) this.dropTab(tabId);
+      // A tab mid-attach may be briefly absent from a sync (the backend's target list lags the
+      // createTarget that made it); dropping it now would fail the attach. Keep it this pass.
+      if (!nextIds.has(tabId) && !this.tabs.get(tabId)?.attaching) this.dropTab(tabId);
     }
     for (const info of next) this.applyTab(info);
   }
@@ -1238,7 +1240,7 @@ export class ExtensionRelayBridge {
         return;
       }
       case "Bridge.timelineCapture": {
-        // Screenshot + a numbered log line for this chat, under ~/.chrome-profile-bridge/timeline/.
+        // Screenshot + a numbered log line for this chat, under ~/.claude-browser-bridge/timeline/.
         const captured = await this.captureTimeline(client, String(request.params?.label ?? ""));
         this.respond(client, request, captured ?? { disabled: true });
         return;

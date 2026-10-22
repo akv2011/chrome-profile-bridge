@@ -15,6 +15,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { createLogger } from "./log.ts";
+import { NulFramer } from "./nul-frames.ts";
 
 const log = createLogger("holder");
 
@@ -54,18 +55,19 @@ export function startHolder(opts: HolderOptions): { chromePid: number | undefine
   };
 
   // Chrome -> daemon. Read always: a full pipe would stall Chrome while no daemon is connected.
-  let inBuf = Buffer.alloc(0);
+  // Linear framing, and only small frames are decoded (a heap-snapshot chunk can be tens of MB).
+  const NUL = Buffer.from([0]);
+  const fromChromeFrames = new NulFramer();
   fromChrome.on("data", (chunk: Buffer) => {
-    inBuf = Buffer.concat([inBuf, chunk]);
-    let z: number;
-    while ((z = inBuf.indexOf(0)) >= 0) {
-      const frame = inBuf.subarray(0, z + 1);
-      inBuf = inBuf.subarray(z + 1);
-      const raw = frame.subarray(0, z).toString("utf8");
-      if (Number(/^\{"id":(\d+)/.exec(raw)?.[1] ?? 0) >= OWN_ID_BASE) continue; // answer to our own cleanup
-      track(raw);
-      client?.write(frame);
-    }
+    fromChromeFrames.push(chunk, (frame) => {
+      const head = frame.subarray(0, 40).toString("utf8");
+      if (Number(/^\{"id":(\d+)/.exec(head)?.[1] ?? 0) >= OWN_ID_BASE) return; // answer to our own cleanup
+      if (frame.length <= 4096) track(frame.toString("utf8"));
+      if (client) {
+        client.write(frame);
+        client.write(NUL);
+      }
+    });
   });
 
   const cleanup = (): void => {
@@ -82,14 +84,13 @@ export function startHolder(opts: HolderOptions): { chromePid: number | undefine
       client.destroy();
     }
     client = sock;
-    let outBuf = Buffer.alloc(0);
+    const toChromeFrames = new NulFramer();
     sock.on("data", (chunk: Buffer) => {
-      outBuf = Buffer.concat([outBuf, chunk]);
-      let z: number;
-      while ((z = outBuf.indexOf(0)) >= 0) {
-        toChrome.write(outBuf.subarray(0, z + 1));
-        outBuf = outBuf.subarray(z + 1);
-      }
+      // Forward whole frames only, so a daemon dropping mid-message never corrupts Chrome's stream.
+      toChromeFrames.push(chunk, (frame) => {
+        toChrome.write(frame);
+        toChrome.write(NUL);
+      });
     });
     sock.on("close", () => {
       if (client !== sock) return;

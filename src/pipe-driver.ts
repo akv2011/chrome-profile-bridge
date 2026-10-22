@@ -22,14 +22,19 @@ export function drivePipeProfile(opts: {
   contextId: string;
   email: string;
   browserVersion: string;
-  /** Blank new-tab pages Chrome opened when the daemon launched this profile for a chat. Closed once
-   *  the chat's first tab exists, so a profile opened for an agent leaves no stray window. */
+  /** Blank new-tab pages of a window the daemon opened for this chat. Closed once the chat has its own
+   *  tab, so an idle profile's window can close instead of lingering (window space, RAM). */
   strayNewTabs?: string[];
+  /** Re-resolve this profile's live context (opening the profile if needed). Called to self-heal when
+   *  Chrome reports the bound context is gone, so an existing chat recovers without reconnecting. */
+  reresolve?: () => Promise<{ contextId: string; strays: string[] } | null>;
 }): { contextId: string; ready: Promise<void>; onTargetEvent: (e: PipeTargetEvent) => void; dispose: () => void } {
-  const { bridge, pipe, contextId, email, browserVersion } = opts;
+  const { bridge, pipe, email, browserVersion } = opts;
+  let contextId = opts.contextId; // mutable: reresolve may rebind it to a fresh context
   const strays = [...(opts.strayNewTabs ?? [])];
   const byTab = new Map<number, string>(); // tabId -> targetId
   const group = new Map<number, number>(); // tabId -> logical groupId
+  const createdAt = new Map<number, number>(); // tabId -> ms, to spare a just-created tab from pruning
   let nextTab = 1;
   let nextGroup = 1;
   const targetId = (tabId: number) => byTab.get(tabId);
@@ -41,23 +46,58 @@ export function drivePipeProfile(opts: {
     close: () => {},
   };
 
+  /** Create a tab in this profile's context. If Chrome says the context is gone (its window closed),
+   *  re-resolve the profile's live context once and retry, so the chat recovers without reconnecting. */
+  async function createInContext(url: string): Promise<string> {
+    try {
+      return ((await pipe.send("Target.createTarget", { url, browserContextId: contextId }, undefined, 20_000)) as { targetId: string }).targetId;
+    } catch (err) {
+      if (!opts.reresolve || !String(err).includes("Failed to find browser context")) throw err;
+      const fresh = await opts.reresolve();
+      if (!fresh) throw err;
+      contextId = fresh.contextId;
+      strays.push(...fresh.strays);
+      log.info(`${email}: context was gone; rebound to a fresh one`);
+      return ((await pipe.send("Target.createTarget", { url, browserContextId: contextId }, undefined, 20_000)) as { targetId: string }).targetId;
+    }
+  }
+
   async function pageTargets(): Promise<PageTarget[]> {
-    const { targetInfos } = (await pipe.send("Target.getTargets")) as {
+    const { targetInfos } = (await pipe.send("Target.getTargets", {}, undefined, 10_000)) as {
       targetInfos: Array<{ targetId: string; type: string; url: string; title: string; browserContextId?: string }>;
     };
-    return targetInfos.filter((t) => t.type === "page" && t.browserContextId === contextId).map((t) => ({ targetId: t.targetId, url: t.url, title: t.title }));
+    // Hide blank new-tab pages (the one a daemon-opened window starts with, until it is closed, and
+    // any of the user's own); the agent should not see or drive them.
+    return targetInfos
+      .filter((t) => t.type === "page" && t.browserContextId === contextId && !/^chrome:\/\/(new-?tab|newtab)/.test(t.url))
+      .map((t) => ({ targetId: t.targetId, url: t.url, title: t.title }));
   }
 
   /** Current tabs the bridge should see: every page in this profile's context, with a stable tabId. */
   async function tabs(): Promise<RelayTabInfo[]> {
     const pages = await pageTargets();
     const live = new Set(pages.map((p) => p.targetId));
-    for (const [tabId, tid] of byTab) if (!live.has(tid)) { byTab.delete(tabId); group.delete(tabId); }
-    return pages.map((p) => {
+    // Target.getTargets lags Target.createTarget, so a just-created tab can be missing here; keep it
+    // for a grace window, or syncTabs on the bridge would drop it while it is still being attached.
+    for (const [tabId, tid] of byTab) {
+      if (live.has(tid)) continue;
+      if (Date.now() - (createdAt.get(tabId) ?? 0) < 10_000) continue;
+      byTab.delete(tabId);
+      group.delete(tabId);
+      createdAt.delete(tabId);
+    }
+    const listed = new Set(pages.map((p) => p.targetId));
+    const out = pages.map((p) => {
       let tabId = tabIdOf(p.targetId);
       if (tabId === undefined) { tabId = nextTab++; byTab.set(tabId, p.targetId); }
       return { tabId, url: p.url, title: p.title, active: false, groupId: group.get(tabId) ?? -1, targetId: p.targetId };
     });
+    // Include just-created tabs that Target.getTargets has not listed yet, so the bridge keeps them.
+    for (const [tabId, tid] of byTab) {
+      if (listed.has(tid)) continue;
+      out.push({ tabId, url: "about:blank", title: "", active: false, groupId: group.get(tabId) ?? -1, targetId: tid });
+    }
+    return out;
   }
 
   function reply(seq: number, result: unknown) {
@@ -78,18 +118,18 @@ export function drivePipeProfile(opts: {
           toBridge?.onMessage(JSON.stringify({ type: "pong" }));
           return;
         case "createTab": {
-          const { targetId: tid } = (await pipe.send("Target.createTarget", { url: String(msg.url ?? "about:blank"), browserContextId: contextId })) as { targetId: string };
+          const tid = await createInContext(String(msg.url ?? "about:blank"));
           const tabId = nextTab++;
           byTab.set(tabId, tid);
+          createdAt.set(tabId, Date.now());
           const gid = typeof msg.groupId === "number" ? msg.groupId : nextGroup++;
           group.set(tabId, gid);
           reply(seq, { tabId, groupId: gid, targetId: tid });
-          for (const stray of strays.splice(0)) {
-            const page = (await pageTargets()).find((p) => p.targetId === stray);
-            if (page && /^chrome:\/\/new-?tab/.test(page.url)) await pipe.send("Target.closeTarget", { targetId: stray }).catch(() => {});
-          }
-          pushTabs();
-          return;
+          // The chat now has a real tab, so the blank new-tab of a window we opened can go; the window
+          // then lives exactly as long as the chat's tabs. The attach is safe from the resulting
+          // targetDestroyed resync (created-tab grace here, attaching guard in the bridge).
+          for (const stray of strays.splice(0)) void pipe.send("Target.closeTarget", { targetId: stray }).catch(() => {});
+          return; // the reply conveys the new tab; a tabs push here would race the bridge's attach
         }
         case "groupTab": {
           const tabId = msg.tabId as number;
@@ -158,7 +198,9 @@ export function drivePipeProfile(opts: {
     .catch((err) => log.warn(`${email}: hello failed: ${String(err)}`));
 
   return {
-    contextId,
+    get contextId() {
+      return contextId; // reflects a reresolve rebind so the daemon compares against the live context
+    },
     ready,
     onTargetEvent: (e) => {
       const ctx = (e.params.targetInfo as { browserContextId?: string } | undefined)?.browserContextId;

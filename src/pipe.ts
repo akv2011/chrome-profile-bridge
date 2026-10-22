@@ -13,6 +13,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import net from "node:net";
 import { createLogger } from "./log.ts";
+import { NulFramer } from "./nul-frames.ts";
 
 const log = createLogger("pipe");
 
@@ -38,7 +39,7 @@ export type PipeOptions = {
 export class ChromePipe {
   private chrome: ChildProcess | null = null;
   private toChrome: NodeJS.WritableStream | null = null;
-  private buf = Buffer.alloc(0);
+  private readonly framer = new NulFramer();
   // Random start: after a daemon restart, Chrome may still answer the previous daemon's commands
   // through the holder, and those ids must not match ours. The holder's own ids sit above 2.1e9.
   private nextId = Math.floor(Math.random() * 1e9) + 1;
@@ -125,53 +126,61 @@ export class ChromePipe {
   }
 
   private onData(chunk: Buffer): void {
-    this.buf = Buffer.concat([this.buf, chunk]);
-    let z: number;
-    while ((z = this.buf.indexOf(0)) >= 0) {
-      const raw = this.buf.subarray(0, z).toString("utf8");
-      this.buf = this.buf.subarray(z + 1);
-      let msg: { id?: number; result?: unknown; error?: { message: string }; sessionId?: string; method?: string; params?: unknown };
-      try {
-        msg = JSON.parse(raw);
-      } catch {
-        continue;
-      }
-      if (typeof msg.id === "number") {
-        const p = this.pending.get(msg.id);
-        if (!p) continue;
-        this.pending.delete(msg.id);
-        msg.error ? p.reject(new Error(msg.error.message)) : p.resolve(msg.result);
-        continue;
-      }
-      if (!msg.method) continue;
-      // Track child sessions so their events route to the right tab.
-      if (msg.method === "Target.attachedToTarget") {
-        const info = (msg.params as { sessionId?: string; targetInfo?: { targetId?: string } }) ?? {};
-        if (info.sessionId && info.targetInfo?.targetId) this.sessionTarget.set(info.sessionId, info.targetInfo.targetId);
-      }
-      if (!msg.sessionId) {
-        // Browser-level event (Target.targetCreated / targetInfoChanged / targetDestroyed).
-        if (msg.method.startsWith("Target.")) this.opts.onTargetEvent?.({ method: msg.method, params: (msg.params as Record<string, unknown>) ?? {} });
-        continue;
-      }
-      const targetId = this.sessionTarget.get(msg.sessionId);
-      if (targetId) this.opts.onEvent({ targetId, sessionId: msg.sessionId, method: msg.method, params: msg.params });
-    }
+    this.framer.push(chunk, (frame) => this.onFrame(frame.toString("utf8")));
   }
 
-  /** One CDP command (browser-scoped, or session-scoped when sessionId is given). */
-  send(method: string, params: Record<string, unknown> = {}, sessionId?: string): Promise<unknown> {
+  private onFrame(raw: string): void {
+    let msg: { id?: number; result?: unknown; error?: { message: string }; sessionId?: string; method?: string; params?: unknown };
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (typeof msg.id === "number") {
+      const p = this.pending.get(msg.id);
+      if (!p) return;
+      this.pending.delete(msg.id);
+      msg.error ? p.reject(new Error(msg.error.message)) : p.resolve(msg.result);
+      return;
+    }
+    if (!msg.method) return;
+    // Track child sessions so their events route to the right tab.
+    if (msg.method === "Target.attachedToTarget") {
+      const info = (msg.params as { sessionId?: string; targetInfo?: { targetId?: string } }) ?? {};
+      if (info.sessionId && info.targetInfo?.targetId) this.sessionTarget.set(info.sessionId, info.targetInfo.targetId);
+    }
+    if (!msg.sessionId) {
+      // Browser-level event (Target.targetCreated / targetInfoChanged / targetDestroyed).
+      if (msg.method.startsWith("Target.")) this.opts.onTargetEvent?.({ method: msg.method, params: (msg.params as Record<string, unknown>) ?? {} });
+      return;
+    }
+    const targetId = this.sessionTarget.get(msg.sessionId);
+    if (targetId) this.opts.onEvent({ targetId, sessionId: msg.sessionId, method: msg.method, params: msg.params });
+  }
+
+  /** One CDP command (browser-scoped, or session-scoped when sessionId is given). With `timeoutMs`
+   *  it rejects instead of waiting forever: Chrome can leave a command unanswered (a page stuck
+   *  loading), and the daemon's own housekeeping must never hang on one. Client commands pass no
+   *  timeout, since some (heap snapshots) legitimately take long. */
+  send(method: string, params: Record<string, unknown> = {}, sessionId?: string, timeoutMs?: number): Promise<unknown> {
     if (!this.toChrome) return Promise.reject(new Error("Chrome is not running"));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = timeoutMs
+        ? setTimeout(() => {
+            if (this.pending.delete(id)) reject(new Error(`CDP ${method} timed out after ${timeoutMs} ms`));
+          }, timeoutMs)
+        : null;
+      timer?.unref?.();
+      const done = () => { if (timer) clearTimeout(timer); };
+      this.pending.set(id, { resolve: (v) => { done(); resolve(v); }, reject: (e) => { done(); reject(e); } });
       this.toChrome?.write(`${JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })}\0`);
     });
   }
 
   /** Attach to a page target with a flat session; returns the sessionId. */
-  async attach(targetId: string): Promise<string> {
-    const { sessionId } = (await this.send("Target.attachToTarget", { targetId, flatten: true })) as { sessionId: string };
+  async attach(targetId: string, timeoutMs?: number): Promise<string> {
+    const { sessionId } = (await this.send("Target.attachToTarget", { targetId, flatten: true }, undefined, timeoutMs)) as { sessionId: string };
     this.sessionTarget.set(sessionId, targetId);
     return sessionId;
   }
@@ -183,7 +192,7 @@ export class ChromePipe {
 
   /** Every page target in the browser (all profiles), for mapping tabs to targetIds. */
   async pageTargets(): Promise<Array<{ targetId: string; url: string; title: string; browserContextId?: string }>> {
-    const { targetInfos } = (await this.send("Target.getTargets")) as {
+    const { targetInfos } = (await this.send("Target.getTargets", {}, undefined, 10_000)) as {
       targetInfos: Array<{ targetId: string; type: string; url: string; title: string; browserContextId?: string }>;
     };
     return targetInfos.filter((t) => t.type === "page");

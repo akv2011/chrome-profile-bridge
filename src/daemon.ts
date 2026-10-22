@@ -183,103 +183,189 @@ export async function startDaemon(opts: DaemonOptions) {
     await pipe.start();
   }
 
-  // contextId -> its profile dir once known. Positive cache only: a failed read (context busy, a
-  // tab-creation race) is transient and must never be remembered as "not a profile", or that context
-  // is skipped forever. `contextTries` bounds re-reads so a genuine non-profile context stops churning.
+  // contextId -> its profile dir (string), or null for a confirmed non-profile context. A read that
+  // merely failed (context tearing down, createTarget race) is NEVER cached, so it is retried, not
+  // poisoned. A context opened by our own --profile-directory launch is cached from the launch, with
+  // no read at all (the slow, flaky part). Most connects after warm-up are pure cache hits.
   const contextDirs = new Map<string, string>();
-  const contextTries = new Map<string, number>();
 
-  /** The profile directory of one browser context, read once from chrome://version over the pipe. */
-  const profileDirOfContext = async (contextId: string): Promise<string | null> => {
+  /** Read one context's profile dir from chrome://version. Robust to slow renders; a createTarget
+   *  failure (context gone) returns null uncached. Caches the result once the page actually loads. */
+  const readContextDir = async (contextId: string): Promise<string | null> => {
     if (!pipe) return null;
-    const known = contextDirs.get(contextId);
-    if (known) return known;
-    if ((contextTries.get(contextId) ?? 0) >= 4) return null; // genuine non-profile; stop re-reading
-    contextTries.set(contextId, (contextTries.get(contextId) ?? 0) + 1);
     let targetId: string;
     try {
-      ({ targetId } = (await pipe.send("Target.createTarget", { url: "chrome://version/", browserContextId: contextId })) as { targetId: string });
+      ({ targetId } = (await pipe.send("Target.createTarget", { url: "chrome://version/", browserContextId: contextId }, undefined, 8_000)) as { targetId: string });
     } catch {
-      return null; // transient (e.g. "Failed to find browser context"); retried next pass
+      return null; // context is gone / tearing down; retry next time, do not cache
     }
     try {
-      const sid = await pipe.attach(targetId);
-      await pipe.send("Page.enable", {}, sid).catch(() => {});
-      let dir: string | null = null;
-      for (let i = 0; i < 12 && !dir; i++) {
-        await new Promise((r) => setTimeout(r, 250));
-        const rv = (await pipe.send("Runtime.evaluate", { expression: "document.getElementById('profile_path')?.textContent||''", returnByValue: true }, sid).catch(() => null)) as { result?: { value?: string } } | null;
-        dir = (rv?.result?.value ?? "").trim() || null;
+      const sid = await pipe.attach(targetId, 5_000);
+      await pipe.send("Page.enable", {}, sid, 5_000).catch(() => {});
+      let dir = "";
+      const deadline = Date.now() + 10_000; // one read never holds a resolve longer than this
+      while (!dir && Date.now() < deadline) {
+        const rv = (await pipe.send("Runtime.evaluate", { expression: "document.getElementById('profile_path')?.textContent||''", returnByValue: true }, sid, 2_000).catch(() => null)) as { result?: { value?: string } } | null;
+        dir = (rv?.result?.value ?? "").trim();
+        if (!dir) await new Promise((r) => setTimeout(r, 250));
       }
+      // Cache only a real answer. An empty read is usually a slow render under load, and caching it as
+      // "not a profile" would hide an open profile and cause a needless launch (a stray window).
       if (dir) contextDirs.set(contextId, dir);
-      return dir;
+      return dir || null;
     } catch {
       return null;
     } finally {
-      await pipe.send("Target.closeTarget", { targetId }).catch(() => {});
+      await pipe.send("Target.closeTarget", { targetId }, undefined, 5_000).catch(() => {});
     }
   };
 
-  /** Context ids that currently hold a page, newest discovery first. */
+  /** Context ids that currently hold a page. */
   const openContexts = async (): Promise<string[]> => {
     if (!pipe) return [];
     const pages = await pipe.pageTargets();
     return [...new Set(pages.map((p) => p.browserContextId).filter((c): c is string => !!c))];
   };
 
-  /** Ensure a bridge + pipe driver exist for a profile; open the profile if it has no window yet. Deduped. */
-  const ensurePipeProfile = async (name: string): Promise<void> => {
-    if (!pipe) return;
-    const existing = drivers.get(name);
-    if (existing) {
-      // Chrome unloads a profile once its last window closes; its context id dies with it.
-      if ((await openContexts()).includes(existing.contextId)) return;
-      log.info(`${name}: its profile closed since the last chat; reopening`);
-      existing.dispose();
-      drivers.delete(name);
+  const matchesDir = (dir: string | null | undefined, wantDir: string, wantPath: string): boolean => !!dir && (dir === wantPath || dir.endsWith(`/${wantDir}`));
+
+  /** Is this context really drivable? A page target can linger after its context dies (a zombie), so
+   *  reuse is only safe if createTarget into it works. A failure drops the dead id from the cache. */
+  const validateContext = async (contextId: string): Promise<boolean> => {
+    if (!pipe) return false;
+    try {
+      const { targetId } = (await pipe.send("Target.createTarget", { url: "about:blank", browserContextId: contextId }, undefined, 8_000)) as { targetId: string };
+      await pipe.send("Target.closeTarget", { targetId }, undefined, 5_000).catch(() => {});
+      return true;
+    } catch {
+      contextDirs.delete(contextId);
+      return false;
     }
+  };
+
+  /** Read-free cache of open contexts' profile dirs at startup, so later connects are cache hits. */
+  const warmContexts = async (): Promise<void> => {
+    for (const c of await openContexts()) if (!contextDirs.has(c)) await readContextDir(c);
+  };
+
+  // Serialize profile launches so "the new context after the launch" is unambiguous. A launch opens a
+  // window with a blank new-tab; every such tab that appears is ours to close later, whether or not
+  // correlation found a new context (a launch into an already-loaded profile reuses its context and
+  // would otherwise strand that window). Only chrome://newtab tabs that did not exist before count:
+  // a chat's own tabs are about:blank or a URL, never the new-tab page.
+  let launchLock: Promise<unknown> = Promise.resolve();
+  const NEW_TAB = /^chrome:\/\/(new-?tab|newtab)/;
+  const launchAndCorrelate = (wantDir: string, wantPath: string): Promise<{ contextId: string | null; strays: string[] }> => {
+    const run = async (): Promise<{ contextId: string | null; strays: string[] }> => {
+      if (!pipe) return { contextId: null, strays: [] };
+      const before = new Set(await openContexts());
+      const beforeTargets = new Set((await pipe.pageTargets()).map((p) => p.targetId));
+      log.info(`opening profile "${wantDir}" for a full-CDP chat`);
+      spawn(opts.pipe?.chromeBinary ?? CHROME_BIN, [`--user-data-dir=${opts.pipe?.userDataDir}`, `--profile-directory=${wantDir}`], { detached: true, stdio: "ignore" }).unref();
+      let fresh: string | null = null;
+      for (let i = 0; i < 16 && !fresh; i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        fresh = (await openContexts()).find((c) => !before.has(c)) ?? null;
+      }
+      if (fresh) contextDirs.set(fresh, wantPath); // the new window is this profile
+      const strays = (await pipe.pageTargets()).filter((p) => !beforeTargets.has(p.targetId) && NEW_TAB.test(p.url)).map((p) => p.targetId);
+      return { contextId: fresh, strays };
+    };
+    const next = launchLock.then(run, run);
+    launchLock = next;
+    return next;
+  };
+
+  const ensurePipeProfile = (name: string): Promise<void> => {
+    if (!pipe) return Promise.resolve();
     let inflight = ensuring.get(name);
     if (!inflight) {
-      inflight = buildPipeProfile(name).finally(() => ensuring.delete(name));
+      inflight = buildOrReuse(name).finally(() => ensuring.delete(name));
       ensuring.set(name, inflight);
     }
     return inflight;
   };
 
-  const buildPipeProfile = async (name: string): Promise<void> => {
-    if (!pipe || drivers.has(name)) return;
+  // Resolve a profile's live context, cheapest first: cache hit, else open + correlate (no read), else
+  // a one-off read of an already-open window. Used for the first build AND, via the driver's
+  // reresolve, to self-heal when Chrome says the context is gone. No keepalive: an idle profile's
+  // window closes (window space, RAM) and the next use reopens it. When we opened the window
+  // ourselves, its blank new-tab is returned as a stray for the driver to close once the chat has a
+  // real tab, so it cannot hold an idle window open. Windows we did not open are never touched.
+  const resolveContext = async (wantDir: string, wantPath: string): Promise<{ contextId: string; strays: string[] } | null> => {
+    if (!pipe) return null;
+    const open = await openContexts();
+    const live = new Set(open);
+    for (const id of [...contextDirs.keys()]) if (!live.has(id)) contextDirs.delete(id); // drop dead ids
+    let how = "cache";
+    let ctx = open.find((c) => matchesDir(contextDirs.get(c), wantDir, wantPath)) ?? null; // cache hit
+    if (ctx && !(await validateContext(ctx))) ctx = null; // the cached context died (window closed)
+    if (!ctx) {
+      // Read already-open windows BEFORE launching: --profile-directory on an open profile would open
+      // a second window in it, which is exactly the clutter we avoid. Reads are cached once each.
+      how = "read";
+      for (const c of await openContexts()) {
+        if (contextDirs.has(c)) continue;
+        if (matchesDir(await readContextDir(c), wantDir, wantPath)) { ctx = c; break; }
+      }
+    }
+    let strays: string[] = [];
+    if (!ctx) {
+      how = "launch";
+      const launched = await launchAndCorrelate(wantDir, wantPath);
+      ctx = launched.contextId;
+      strays = launched.strays;
+      if (!ctx) {
+        // The profile was loaded after all (the launch reused its context): find it, and still close the window the launch opened.
+        how = "launch+read";
+        for (const c of await openContexts()) {
+          const dir = contextDirs.get(c) ?? (await readContextDir(c));
+          if (matchesDir(dir, wantDir, wantPath)) { ctx = c; break; }
+        }
+      }
+    }
+    if (!ctx) {
+      for (const s of strays) void pipe.send("Target.closeTarget", { targetId: s }).catch(() => {});
+      return null;
+    }
+    log.info(`${wantDir}: resolved via ${how} (context ${ctx.slice(0, 8)}, strays ${strays.length})`);
+    return { contextId: ctx, strays };
+  };
+
+  const buildOrReuse = async (name: string): Promise<void> => {
+    if (!pipe) return;
     const wantDir = profileDirForName(name, env);
     if (!wantDir) throw new Error(`${name}: no Chrome profile directory mapped (profiles.json)`);
     const wantPath = `${chromeDir(env)}/${wantDir}`;
-    const find = async (): Promise<string | null> => {
-      const ctxs = await openContexts();
-      const seen: string[] = [];
-      for (const ctx of ctxs) {
-        const dir = await profileDirOfContext(ctx);
-        seen.push(`${ctx.slice(0, 6)}=${dir ? dir.split("/").pop() : "·"}`);
-        if (dir && (dir === wantPath || dir.endsWith(`/${wantDir}`))) return ctx;
-      }
-      if (env.CBB_DEBUG_FIND) log.info(`${name}: want "${wantDir}" among [${seen.join(", ")}]`);
-      return null;
-    };
-    let ctx = await find();
-    const launched = !ctx;
-    if (!ctx) {
-      log.info(`${name}: opening profile "${wantDir}" for a full-CDP chat`);
-      spawn(opts.pipe?.chromeBinary ?? CHROME_BIN, [`--user-data-dir=${opts.pipe?.userDataDir}`, `--profile-directory=${wantDir}`], { detached: true, stdio: "ignore" }).unref();
-      for (let i = 0; i < 40 && !ctx; i++) { await new Promise((r) => setTimeout(r, 500)); ctx = await find(); }
+    const resolved = await resolveContext(wantDir, wantPath);
+    if (!resolved) throw new Error(`${name}: could not find or open its profile window`);
+    const ctx = resolved.contextId;
+    const existing = drivers.get(name);
+    if (existing) {
+      if (existing.contextId === ctx) return; // same live context, reuse the driver
+      existing.dispose(); // the old context died; rebuild on the new one
+      drivers.delete(name);
     }
-    if (!ctx) throw new Error(`${name}: could not find or open its profile window`);
     const email = chromeEmails(env).get(wantDir) ?? `${name}@profile.local`;
     const bridge = bridgeFor(name);
-    const strayNewTabs = launched
-      ? (await pipe.pageTargets()).filter((p) => p.browserContextId === ctx && /^chrome:\/\/new-?tab/.test(p.url)).map((p) => p.targetId)
-      : [];
-    const driver = drivePipeProfile({ bridge, pipe, contextId: ctx, email, browserVersion: "Chrome", strayNewTabs });
+    // reresolve lets the driver recover a dead context without the client reconnecting.
+    const driver = drivePipeProfile({
+      bridge,
+      pipe,
+      contextId: ctx,
+      email,
+      browserVersion: "Chrome",
+      strayNewTabs: resolved.strays,
+      reresolve: () => resolveContext(wantDir, wantPath),
+    });
     drivers.set(name, driver);
     await driver.ready; // the bridge has the profile's tabs + identity before the client talks
     log.info(`${name}: full-CDP driver ready (context ${ctx.slice(0, 8)}, ${email})`);
   };
+
+  // Warm the cache for whatever profiles the holder's Chrome restored, so the first connects are
+  // cache hits instead of a burst of chrome://version reads.
+  if (pipe) void warmContexts().catch(() => {});
 
   const openProfile =
     opts.openProfile ??
@@ -449,6 +535,9 @@ export async function startDaemon(opts: DaemonOptions) {
     bridges,
     /** Chats connected right now, across every profile; the self-update waits for zero. */
     cdpClients: () => [...bridges.values()].reduce((n, b) => n + b.cdpClientCount, 0),
+    /** Profiles whose setup (opening a window, mapping the context) is in flight; a restart here
+     *  would kill a connect that has not yet registered as a client, so the self-update waits for it. */
+    pendingSetups: () => ensuring.size,
     close: async () => {
       for (const bridge of bridges.values()) bridge.dispose();
       pipe?.stop();
@@ -486,9 +575,14 @@ if (import.meta.main) {
   const versionFile = path.join(path.dirname(import.meta.dirname), "VERSION");
   const readVersion = () => { try { return fs.readFileSync(versionFile, "utf8").trim(); } catch { return ""; } };
   const running = readVersion();
+  let idleTicks = 0;
   setInterval(() => {
+    const busy = daemon.cdpClients() > 0 || daemon.pendingSetups() > 0;
+    idleTicks = busy ? 0 : idleTicks + 1;
     const next = readVersion();
-    if (!next || next === running || daemon.cdpClients() > 0) return;
+    // Restart only after a sustained quiet window (no chats, no setups in flight for ~60s), so a
+    // connect that is opening a profile is never cut off mid-setup.
+    if (!next || next === running || busy || idleTicks < 2) return;
     log.info(`new code ${next.slice(0, 7)} (running ${running.slice(0, 7) || "unversioned"}); restarting while idle`);
     process.exit(0);
   }, 30_000).unref();
