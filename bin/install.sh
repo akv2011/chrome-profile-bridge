@@ -31,6 +31,13 @@ chmod 755 "$(git -C "$SRC" rev-parse --git-common-dir)/hooks/post-commit"
 mkdir -p -m 700 "$HOME_DIR" "$HOME/.local/bin"
 [ -f "$HOME_DIR/profiles.json" ] || cp "$SRC/profiles.json.example" "$HOME_DIR/profiles.json"
 install -m 755 "$SRC/bin/cbb-mcp" "$HOME/.local/bin/cbb-mcp"
+# Clients started before the switch keep running `playwright-mcp --extension --profile-dir-name X`,
+# which hangs waiting on Microsoft's extension. With a global @playwright/mcp, the shim takes its bin
+# path and routes that call here; anything else passes through. `npm i -g @playwright/mcp` undoes it.
+NPM_PREFIX=$(npm prefix -g 2>/dev/null || true)
+if [ -n "$NPM_PREFIX" ] && [ -f "$NPM_PREFIX/lib/node_modules/@playwright/mcp/cli.js" ]; then
+  rm -f "$NPM_PREFIX/bin/playwright-mcp" && install -m 755 "$SRC/bin/playwright-mcp-shim" "$NPM_PREFIX/bin/playwright-mcp"
+fi
 
 CHROME_DATA="$HOME/ChromeData"
 CHROME_DEFAULT="$HOME/Library/Application Support/Google/Chrome"

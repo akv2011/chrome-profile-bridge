@@ -87,6 +87,9 @@ Across profiles: `bin/cbb-fanout <name…> [--url <url>] -- "<expression>"` runs
    profile automatically. In extension mode only, also Load unpacked
    `~/.chrome-profile-bridge/extension` in each profile.
 4. `bin/use-bridge.sh` points your `pw-*` MCP entries at the bridge.
+   Clients already running keep their old command; with a global `@playwright/mcp`, install.sh
+   puts a shim at its `playwright-mcp` path that sends `--extension --profile-dir-name X` calls to
+   the bridge, so a `/mcp reconnect` fixes them without a restart.
 5. Status: `curl -s http://127.0.0.1:18765/status`. Log: `~/.chrome-profile-bridge/daemon.log`.
 
 ## Limits

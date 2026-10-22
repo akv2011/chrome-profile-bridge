@@ -1,0 +1,39 @@
+#!/usr/bin/env node
+// Installed over <npm prefix>/bin/playwright-mcp (normally a symlink to the npm package's cli.js).
+//
+// MCP clients started before your pw-* entries moved to the bridge keep the MCP command they launched with:
+//   playwright-mcp --extension --profile-dir-name '<Profile dir>'
+// That path waits on the Microsoft Playwright extension's connect approval, so it hangs forever now
+// that Chrome is driven over the bridge. This shim sends that exact call to the bridge instead
+// (cbb-mcp for the pw-* name mapped to that profile dir in profiles.json), so every stale client,
+// including ones reaching this Mac over ssh, works again after a /mcp reconnect. Anything else, or a
+// profile dir the bridge does not map, goes to the real Playwright MCP unchanged.
+//
+// `npm i -g @playwright/mcp` restores the symlink; bin/install.sh puts the shim back.
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// The npm package next to this bin dir (<prefix>/bin/playwright-mcp -> <prefix>/lib/node_modules/...).
+const REAL_CLI = path.resolve(path.dirname(process.argv[1]), "../lib/node_modules/@playwright/mcp/cli.js");
+const args = process.argv.slice(2);
+
+function bridgeName() {
+  const at = args.indexOf("--profile-dir-name");
+  if (!args.includes("--extension") || at < 0) return null;
+  const dir = args[at + 1];
+  try {
+    const profiles = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".chrome-profile-bridge", "profiles.json"), "utf8"));
+    return Object.keys(profiles).find((name) => profiles[name] === dir) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+const name = bridgeName();
+const child = name
+  ? spawn(process.execPath, [path.join(os.homedir(), ".local", "bin", "cbb-mcp"), name], { stdio: "inherit" })
+  : spawn(process.execPath, [REAL_CLI, ...args], { stdio: "inherit" });
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => child.kill(signal));
+child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
