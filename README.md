@@ -33,7 +33,8 @@ daemon per machine that holds a single extension socket per profile and serves C
   }
   ```
 - Adopt or release one of your own tabs through a browser session: `Bridge.listAllTabs`,
-  `Bridge.adoptTab { tabId }`, `Bridge.releaseTab { tabId }`.
+  `Bridge.adoptTab { tabId }`, `Bridge.releaseTab { tabId }`. A tab in another chat's group is refused
+  unless you name that chat: `{ tabId, fromChat: "<its key>" }`.
 
 ## Agent methods (`Bridge.*`)
 

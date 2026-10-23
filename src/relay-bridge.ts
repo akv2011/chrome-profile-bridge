@@ -1388,6 +1388,15 @@ export class ExtensionRelayBridge {
           this.respondError(client, request, "tabId (number) is required; Bridge.listAllTabs lists them", -32602);
           return;
         }
+        // Taking another chat's tab (connected, or within its reconnect grace) detaches that chat's page
+        // mid-task, so it must be deliberate: name the chat. A loop over Bridge.listAllTabs adopting
+        // everything (a debug probe did this once) is refused instead of silently breaking two agents.
+        const groupId = this.tabs.get(tabId)?.info.groupId;
+        const holder = [...this.owners.values()].find((o) => o !== owner && o.groupId !== null && o.groupId === groupId);
+        if (holder && request.params?.fromChat !== holder.key) {
+          this.respondError(client, request, `tab ${tabId} belongs to chat "${holder.key}"; pass fromChat: "${holder.key}" to take it from that chat`, -32602);
+          return;
+        }
         const moved = (await this.callExtension({
           type: "groupTab",
           tabId,

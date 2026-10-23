@@ -95,4 +95,22 @@ describe("no-extension pipe mode", () => {
     expect(tb).toContain("?b");
     expect(tb).not.toContain("?a");
   }, 90_000);
+
+  it("refuses to hand one chat's tab to another chat", async () => {
+    const cdp = (client: string) => chromium.connectOverCDP(`ws://127.0.0.1:${daemon.port}/cdp/pw-test?client=${client}`);
+    const [a, b] = [await cdp("ADOPT_A"), await cdp("ADOPT_B")];
+    try {
+      const pageA = await a.contexts()[0].newPage();
+      await pageA.goto("data:text/html,<title>adopt-a</title>");
+      const pageB = await b.contexts()[0].newPage();
+      const s = await pageB.context().newCDPSession(pageB);
+      const { tabs } = (await s.send("Bridge.listAllTabs" as never)) as { tabs: Array<{ tabId: number; url: string }> };
+      const tabOfA = tabs.find((t) => t.url.includes("adopt-a"));
+      expect(tabOfA, JSON.stringify(tabs)).toBeDefined();
+      await expect(s.send("Bridge.adoptTab" as never, { tabId: tabOfA?.tabId } as never)).rejects.toThrow(/belongs to chat "ADOPT_A"; pass fromChat/);
+      expect(await pageA.title()).toBe("adopt-a"); // A still drives its tab
+    } finally {
+      await Promise.all([a.close(), b.close()]);
+    }
+  }, 60_000);
 });

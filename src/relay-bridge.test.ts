@@ -224,7 +224,7 @@ describe("ExtensionRelayBridge", () => {
     expect((await second.send("Browser.getVersion"))?.result).toBeTruthy();
   });
 
-  it("moves a tab between chats with Bridge.adoptTab", async () => {
+  it("moves a tab between chats with Bridge.adoptTab only when the source chat is named", async () => {
     const { bridge, ext } = setup();
     const a = connect(bridge, "Chat_A");
     const b = connect(bridge, "Chat_B");
@@ -233,7 +233,9 @@ describe("ExtensionRelayBridge", () => {
     await a.send("Target.createTarget", { url: "https://a.test" });
     await b.send("Target.createTarget", { url: "https://b.test" });
 
-    const adopted = await b.send("Bridge.adoptTab", { tabId: 100 });
+    const refused = await b.send("Bridge.adoptTab", { tabId: 100 });
+    expect(JSON.stringify(refused?.error)).toContain('fromChat: \\"Chat_A\\"');
+    const adopted = await b.send("Bridge.adoptTab", { tabId: 100, fromChat: "Chat_A" });
     expect(adopted?.result).toMatchObject({ groupId: 11 });
     await flush();
     expect(a.socket.events("Target.detachedFromTarget")).toHaveLength(1);
