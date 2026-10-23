@@ -201,6 +201,9 @@ export async function startDaemon(opts: DaemonOptions) {
   // poisoned. A context opened by our own --profile-directory launch is cached from the launch, with
   // no read at all (the slow, flaky part). Most connects after warm-up are pure cache hits.
   const contextDirs = new Map<string, string>();
+  // Why the last tab open into a context failed, for the resolve-failure log (a profile once
+  // refused new tabs for ~2 min while it had pages, and nothing said why).
+  const openErrors = new Map<string, string>();
 
   /** Read one context's profile dir from chrome://version. Robust to slow renders; a createTarget
    *  failure (context gone) returns null uncached. Caches the result once the page actually loads. */
@@ -209,7 +212,8 @@ export async function startDaemon(opts: DaemonOptions) {
     let targetId: string;
     try {
       ({ targetId } = (await pipe.send("Target.createTarget", { url: "chrome://version/", browserContextId: contextId }, undefined, 8_000)) as { targetId: string });
-    } catch {
+    } catch (err) {
+      openErrors.set(contextId, String(err));
       return null; // context is gone / tearing down; retry next time, do not cache
     }
     try {
@@ -249,8 +253,10 @@ export async function startDaemon(opts: DaemonOptions) {
     try {
       const { targetId } = (await pipe.send("Target.createTarget", { url: "about:blank", browserContextId: contextId }, undefined, 8_000)) as { targetId: string };
       await pipe.send("Target.closeTarget", { targetId }, undefined, 5_000).catch(() => {});
+      openErrors.delete(contextId);
       return true;
-    } catch {
+    } catch (err) {
+      openErrors.set(contextId, String(err));
       contextDirs.delete(contextId);
       return false;
     }
@@ -345,6 +351,12 @@ export async function startDaemon(opts: DaemonOptions) {
       }
     }
     if (!ctx) {
+      const pages = await pipe.pageTargets().catch(() => []);
+      const seen = [...new Set(pages.map((p) => p.browserContextId ?? "none"))].map((c) => {
+        const urls = pages.filter((p) => (p.browserContextId ?? "none") === c).map((p) => p.url.slice(0, 40));
+        return `${c.slice(0, 8)}=${contextDirs.get(c)?.split("/").pop() ?? "?"} [${urls.join(", ")}]${openErrors.has(c) ? ` (${openErrors.get(c)})` : ""}`;
+      });
+      log.warn(`${wantDir}: no context matched after a launch (strays ${strays.length}); contexts: ${seen.join("; ")}`);
       for (const s of strays) void pipe.send("Target.closeTarget", { targetId: s }).catch(() => {});
       return null;
     }
