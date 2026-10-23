@@ -15,6 +15,9 @@ const log = createLogger("pipe-driver");
 
 type PageTarget = { targetId: string; url: string; title: string };
 
+/** URL prefix of the tab the daemon opens through Chrome's command line; hidden until a chat uses it. */
+export const LAUNCH_MARKER = "data:text/html,<title>cbb-";
+
 /** Attach one profile to the bridge, driven by the shared pipe and scoped to `contextId`. */
 export function drivePipeProfile(opts: {
   bridge: ExtensionRelayBridge;
@@ -22,15 +25,21 @@ export function drivePipeProfile(opts: {
   contextId: string;
   email: string;
   browserVersion: string;
-  /** Blank new-tab pages of a window the daemon opened for this chat. Closed once the chat has its own
-   *  tab, so an idle profile's window can close instead of lingering (window space, RAM). */
+  /** Tabs the daemon opened in this profile by launch. The first becomes the chat's first tab; the rest
+   *  close once the chat has its own, so an idle profile's window can close (window space, RAM). */
   strayNewTabs?: string[];
-  /** Re-resolve this profile's live context (opening the profile if needed). Called to self-heal when
-   *  Chrome reports the bound context is gone, so an existing chat recovers without reconnecting. */
-  reresolve?: () => Promise<{ contextId: string; strays: string[] } | null>;
-}): { contextId: string; ready: Promise<void>; onTargetEvent: (e: PipeTargetEvent) => void; dispose: () => void } {
+  /** Open a tab in this profile through Chrome's command line, returning it and the profile's live
+   *  context. Used when Target.createTarget refuses the context, so a chat never has to reconnect. */
+  openTab?: () => Promise<{ targetId: string; contextId: string } | null>;
+}): {
+  contextId: string;
+  ready: Promise<void>;
+  onTargetEvent: (e: PipeTargetEvent) => void;
+  addStrays: (targetIds: string[]) => void;
+  dispose: () => void;
+} {
   const { bridge, pipe, email, browserVersion } = opts;
-  let contextId = opts.contextId; // mutable: reresolve may rebind it to a fresh context
+  let contextId = opts.contextId; // mutable: openTab may rebind it to a fresh context
   const strays = [...(opts.strayNewTabs ?? [])];
   const byTab = new Map<number, string>(); // tabId -> targetId
   const group = new Map<number, number>(); // tabId -> logical groupId
@@ -46,19 +55,34 @@ export function drivePipeProfile(opts: {
     close: () => {},
   };
 
-  /** Create a tab in this profile's context. If Chrome says the context is gone (its window closed),
-   *  re-resolve the profile's live context once and retry, so the chat recovers without reconnecting. */
+  /** Create a tab in this profile's context. Chrome's Target.createTarget finds a signed-in profile's
+   *  context only while it is the last-used profile (DevToolsBrowserContextManager::GetProfileById), and
+   *  any other profile's window becoming active changes that. So a tab the daemon already opened by
+   *  launch goes first, and a refused createTarget opens one by launch, which works for any profile. */
   async function createInContext(url: string): Promise<string> {
+    const spare = strays.shift();
+    if (spare && (await navigate(spare, url))) return spare;
     try {
       return ((await pipe.send("Target.createTarget", { url, browserContextId: contextId }, undefined, 20_000)) as { targetId: string }).targetId;
     } catch (err) {
-      if (!opts.reresolve || !String(err).includes("Failed to find browser context")) throw err;
-      const fresh = await opts.reresolve();
-      if (!fresh) throw err;
-      contextId = fresh.contextId;
-      strays.push(...fresh.strays);
-      log.info(`${email}: context was gone; rebound to a fresh one`);
-      return ((await pipe.send("Target.createTarget", { url, browserContextId: contextId }, undefined, 20_000)) as { targetId: string }).targetId;
+      if (!opts.openTab || !String(err).includes("Failed to find browser context")) throw err;
+      const opened = await opts.openTab();
+      if (!opened || !(await navigate(opened.targetId, url))) throw err;
+      if (opened.contextId !== contextId) log.info(`${email}: context was gone; rebound to a fresh one`);
+      contextId = opened.contextId;
+      return opened.targetId;
+    }
+  }
+
+  /** Point a tab the daemon opened at the chat's URL. False if the tab is gone. */
+  async function navigate(tid: string, url: string): Promise<boolean> {
+    try {
+      const sessionId = await pipe.attach(tid, 5_000);
+      await pipe.send("Page.navigate", { url }, sessionId, 10_000);
+      void pipe.detach(sessionId);
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -69,7 +93,7 @@ export function drivePipeProfile(opts: {
     // Hide blank new-tab pages (the one a daemon-opened window starts with, until it is closed, and
     // any of the user's own); the agent should not see or drive them.
     return targetInfos
-      .filter((t) => t.type === "page" && t.browserContextId === contextId && !/^chrome:\/\/(new-?tab|newtab)/.test(t.url))
+      .filter((t) => t.type === "page" && t.browserContextId === contextId && !/^chrome:\/\/(new-?tab|newtab)/.test(t.url) && !t.url.startsWith(LAUNCH_MARKER))
       .map((t) => ({ targetId: t.targetId, url: t.url, title: t.title }));
   }
 
@@ -199,9 +223,10 @@ export function drivePipeProfile(opts: {
 
   return {
     get contextId() {
-      return contextId; // reflects a reresolve rebind so the daemon compares against the live context
+      return contextId; // reflects an openTab rebind so the daemon compares against the live context
     },
     ready,
+    addStrays: (targetIds) => void strays.push(...targetIds),
     onTargetEvent: (e) => {
       const ctx = (e.params.targetInfo as { browserContextId?: string } | undefined)?.browserContextId;
       // targetDestroyed carries only targetId; refresh on anything that could change this context's tabs.

@@ -5,6 +5,15 @@ recurring theme in the full-CDP (pipe) path is Chrome's browser-context lifecycl
 not durable, it dies when a profile's last window closes, and the daemon must never treat a cached
 or in-use context id as permanent.
 
+## Only the last-used profile takes new tabs (2026-10-23)
+
+| Symptom | Cause | Fix | Commit |
+|---|---|---|---|
+| Connects return 500 "could not find or open its profile window" while the profile has open tabs; most connects take 8-10 s and pop a new window | Chrome resolves a `browserContextId` for `Target.createTarget` only for the last-used profile (the one whose window was active last) or a CDP-made context (`DevToolsBrowserContextManager::GetProfileById`). Any other profile's window opening or being clicked makes every other profile's createTarget fail "Failed to find browser context", which the daemon read as a dead context: validate failed, it relaunched `--profile-directory`, waited 8 s for a new context that never came, then re-read; when the launch did not make the profile last-used (another window took focus first) the re-read failed too. Reproduced under Xvfb: a fresh launch of Profile 2 makes createTarget into Default fail, and back | Validate a cached context by attaching to one of its pages, which works for any profile. Open tabs that createTarget refuses through Chrome's command line with a unique `data:` marker URL (`--profile-directory=X data:text/html,<title>cbb-<uuid></title>`): the tab lands in that profile whatever window is active, and its context is known exactly from the marker, so launch-correlation and the 8 s wait are gone. The marker tab becomes the chat's first tab. `src/profiles.e2e.test.ts` (headful, Xvfb): the second Default chat took 9.0 s on the old code and fails its 5 s bound; the whole test passes in 4.3 s now | daemon + driver |
+
+Earlier rows that blamed "Failed to find browser context" on a closed window were probably this in part:
+the profile was alive, just not the last-used one.
+
 ## Full-CDP context lifecycle (2026-10-22)
 
 Surfaced when driving several real signed-in profiles, with more than one chat per profile, over a
@@ -35,8 +44,8 @@ multi-session behaviour with repeated live runs, not one lucky run.
   never launched again, so it never gets a second window.
 - No hangs: every CDP call the daemon makes for its own bookkeeping has a timeout, so a stuck page
   can slow one resolve by seconds, never stall the rest.
-- Profiles are identified by launch-correlation (no per-context reads in the hot path); the cache is
-  warmed once and a transient read failure is never cached.
+- Profiles are identified by a marker tab opened by launch (no per-context reads in the hot path, no
+  correlation); the cache is warmed once and a transient read failure is never cached.
 - A just-created tab survives the `getTargets` lag; an attaching tab is never dropped by a sync.
 - The self-update never restarts the daemon while a connect is setting up or a chat is connected.
 
