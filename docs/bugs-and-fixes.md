@@ -13,6 +13,8 @@ or in-use context id as permanent.
 
 | Two live chats lost their tabs mid-task | A debug probe looped over `Bridge.listAllTabs` calling `Bridge.adoptTab` on each; adopt moves any tab, including one in another connected chat's group, and that chat's page silently detaches | `Bridge.adoptTab` refuses a tab in another chat's group unless the caller names it (`fromChat: "<key>"`), so a hand-off stays possible but never happens by accident. `pipe.e2e`: on the old code chat B took chat A's tab | bridge |
 
+| After a profile's window closed and reopened, a new chat's `newPage` failed "Cannot read properties of undefined (reading '_page')" and each try left a blank tab | The driver's tab and group counters lived in each driver and restarted at 1 when Chrome unloaded the profile and the daemon rebuilt its driver, while the bridge kept its chats' group ids. A new chat got a group an older chat still held, so `ownerOfGroup` sent the new tab's `attachedToTarget` to the older chat | Tab and group ids are per daemon (module scope), so a rebuilt driver never reuses one. `profiles.e2e`: close the profile's only tab, reconnect, `newPage`: failed with the exact error before, passes now | driver |
+
 Earlier rows that blamed "Failed to find browser context" on a closed window were probably this in part:
 the profile was alive, just not the last-used one.
 

@@ -15,6 +15,13 @@ const log = createLogger("pipe-driver");
 
 type PageTarget = { targetId: string; url: string; title: string };
 
+// Tab and group ids are per daemon, not per driver. A profile's driver is rebuilt whenever Chrome
+// unloads and reopens the profile (its last window closed), while the bridge keeps its chats and their
+// group ids; a rebuilt driver counting from 1 again gave a new chat a group an older chat still held,
+// so the new tab's attach went to that chat and Playwright's newPage failed.
+let nextTab = 1;
+let nextGroup = 1;
+
 /** URL prefix of the tab the daemon opens through Chrome's command line; hidden until a chat uses it. */
 export const LAUNCH_MARKER = "data:text/html,<title>cbb-";
 
@@ -44,8 +51,6 @@ export function drivePipeProfile(opts: {
   const byTab = new Map<number, string>(); // tabId -> targetId
   const group = new Map<number, number>(); // tabId -> logical groupId
   const createdAt = new Map<number, number>(); // tabId -> ms, to spare a just-created tab from pruning
-  let nextTab = 1;
-  let nextGroup = 1;
   const targetId = (tabId: number) => byTab.get(tabId);
   const tabIdOf = (tid: string) => [...byTab].find(([, t]) => t === tid)?.[0];
 

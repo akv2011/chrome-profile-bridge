@@ -36,7 +36,7 @@ beforeAll(async () => {
   }
   home = fs.mkdtempSync(path.join(os.tmpdir(), "cbb-prof-home-"));
   udd = fs.mkdtempSync(path.join(os.tmpdir(), "cbb-prof-udd-"));
-  fs.writeFileSync(path.join(home, "profiles.json"), JSON.stringify({ "pw-a": "Default", "pw-b": "Profile 2" }));
+  fs.writeFileSync(path.join(home, "profiles.json"), JSON.stringify({ "pw-a": "Default", "pw-b": "Profile 2", "pw-c": "Profile 3" }));
   daemon = await startDaemon({
     port: 0,
     extensionDir: path.join(import.meta.dirname, "..", "extension"),
@@ -70,4 +70,26 @@ describe("several profiles in one Chrome", () => {
     expect(await b("browser_tabs", { action: "new" })).not.toContain("ERROR");
     expect(await profileOf(b)).toContain(path.join(udd, "Profile 2"));
   }, 120_000);
+
+  it("gives a new chat a working page after its profile's window closed and reopened", async () => {
+    const cdp = (client: string) => chromium.connectOverCDP(`ws://127.0.0.1:${daemon.port}/cdp/pw-c?client=${client}`);
+    const first = await cdp("REOPEN_1");
+    const page1 = await first.contexts()[0].newPage();
+    await page1.goto("data:text/html,<title>first</title>");
+    // Closing the profile's only tab closes its window, so Chrome unloads the profile; the next chat
+    // reopens it in a new context and the daemon rebuilds the profile's driver. REOPEN_1 keeps its tab
+    // group through the reconnect grace.
+    await page1.close();
+    await first.close();
+    await new Promise((r) => setTimeout(r, 3_000));
+
+    const second = await cdp("REOPEN_2");
+    try {
+      const page2 = await second.contexts()[0].newPage();
+      await page2.goto("data:text/html,<title>second</title>");
+      expect(await page2.title()).toBe("second");
+    } finally {
+      await second.close();
+    }
+  }, 60_000);
 });
