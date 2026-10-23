@@ -77,6 +77,9 @@ Across profiles: `bin/cbb-fanout <name…> [--url <url>] -- "<expression>"` runs
   ServiceWorker, Security, Profiler, Memory, HeapProfiler); most have a workaround (page JS for
   storage, Tracing for CPU profiles, Performance metrics for DOM counts). Use this if you cannot
   move the Chrome data directory.
+  Chrome launches with `--disable-blink-features=AutomationControlled` (`CBB_CHROME_EXTRA`, set by
+  `bin/install.sh`): the pipe alone makes `navigator.webdriver` true and Cloudflare checks never clear.
+  Keep it; see `docs/full-cdp.md`.
 
 ## Setup
 

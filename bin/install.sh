@@ -69,7 +69,10 @@ if [ "$FULL" = 1 ]; then
   PIPE_ENV="
     <key>CBB_CHROME_UDD</key><string>$CHROME_DATA</string>
     <key>CBB_CHROME_DIR</key><string>$CHROME_DATA</string>
-    <key>CBB_CHROME_SOCKET</key><string>$HOME_DIR/chrome.sock</string>"
+    <key>CBB_CHROME_SOCKET</key><string>$HOME_DIR/chrome.sock</string>
+    <key>CBB_CHROME_EXTRA</key><string>--disable-blink-features=AutomationControlled</string>"
+  # --remote-debugging-pipe makes navigator.webdriver true in every tab, so Cloudflare's automatic check
+  # never clears ("Just a moment" forever); this flag keeps it false.
   plist "$LABEL.chrome" holder.ts "$PIPE_ENV" holder
   plist "$LABEL" daemon.ts "$PIPE_ENV" daemon
   # Never restart a running holder: that closes Chrome. Start it only if it is not loaded.

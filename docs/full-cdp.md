@@ -48,3 +48,20 @@ default directory.
 Lower-touch alternative: keep the extension-only path (it covers all signed-in browsing and most
 DevTools) and only reach for a debugging copy of a profile when you need heap snapshots, JS
 coverage or cert bypass.
+
+## navigator.webdriver and Cloudflare
+
+`--remote-debugging-pipe` turns on Blink's AutomationControlled, so `navigator.webdriver` is true in every tab
+of the real Chrome. Cloudflare's managed check ("Just a moment...") then never clears, on any site, for you as
+well as for agents.
+
+- **Fix:** the holder launches Chrome with `--disable-blink-features=AutomationControlled` through
+  `CBB_CHROME_EXTRA` (set in `bin/install.sh`). A pipe-launched Chromium reads `webdriver=true` without the flag,
+  `false` with it. `Emulation.setAutomationOverride {enabled:false}` per tab does not override the launch
+  switch. Changing the flag needs the holder reloaded while Chrome is closed (reloading it while Chrome runs
+  closes the browser).
+- **A tab with a CDP client attached can still be caught** with webdriver false. A challenge clears in a plain
+  tab: open the URL through Chrome's singleton hand-off,
+  `"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --user-data-dir=$HOME/ChromeData --profile-directory="Profile N" <url>`,
+  wait about 25 s, then read `cf_clearance` with `context.cookies(url)` without attaching to that tab.
+  Automated tabs then load the site on that cookie.
