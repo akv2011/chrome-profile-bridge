@@ -157,7 +157,10 @@ export function drivePipeProfile(opts: {
           return;
         case "createTab": {
           const tid = await createInContext(String(msg.url ?? "about:blank"));
-          const tabId = nextTab++;
+          // A tab listing may already have given this target an id: Chrome lists a just-launched tab with
+          // an empty URL at times, which the marker filter misses. A second id for the same target vanished
+          // on the next sync, so the chat lost its first page and the tab sat in no group.
+          const tabId = tabIdOf(tid) ?? nextTab++;
           byTab.set(tabId, tid);
           createdAt.set(tabId, Date.now());
           const gid = typeof msg.groupId === "number" ? msg.groupId : nextGroup++;
