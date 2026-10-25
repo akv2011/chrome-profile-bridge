@@ -35,6 +35,10 @@ daemon per machine that holds a single extension socket per profile and serves C
 - Adopt or release one of your own tabs through a browser session: `Bridge.listAllTabs`,
   `Bridge.adoptTab { tabId }`, `Bridge.releaseTab { tabId }`. A tab in another chat's group is refused
   unless you name that chat: `{ tabId, fromChat: "<its key>" }`.
+- A popup a chat's page opens (`window.open`, a `target=_blank` link) joins that chat, so
+  `page.waitForEvent("popup")` gets it; no `Bridge.adoptTab` needed.
+- Raw CDP clients (not Playwright): `Target.getTargets` lists only the tabs this chat has attached, so
+  send `Target.setAutoAttach` first, as Playwright does.
 
 ## Agent methods (`Bridge.*`)
 

@@ -96,6 +96,34 @@ describe("no-extension pipe mode", () => {
     expect(tb).not.toContain("?a");
   }, 90_000);
 
+  it("gives a chat the popups its pages open (window.open, target=_blank)", async () => {
+    const http = await import("node:http");
+    const server = http.createServer((req, res) => {
+      res.setHeader("content-type", "text/html");
+      res.end(req.url === "/" ? `<a href="/linked" target="_blank">open</a>` : `<title>${req.url?.slice(1)}</title>`);
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const browser = await chromium.connectOverCDP(`ws://127.0.0.1:${daemon.port}/cdp/pw-test?client=POPUP_A`);
+    try {
+      const page = await browser.contexts()[0].newPage();
+      await page.goto(`${origin}/`);
+      const [scripted] = await Promise.all([page.waitForEvent("popup", { timeout: 10_000 }), page.evaluate((u) => void window.open(u), `${origin}/scripted`)]);
+      const [linked] = await Promise.all([page.waitForEvent("popup", { timeout: 10_000 }), page.click("a")]);
+      expect(await scripted.title()).toBe("scripted"); // the chat drives both popups
+      expect(await linked.title()).toBe("linked");
+      const s = await page.context().newCDPSession(page);
+      const { tabs } = (await s.send("Bridge.listAllTabs" as never)) as { tabs: Array<{ url: string; groupId: number }> };
+      const groupOf = (path: string) => tabs.find((t) => t.url === `${origin}${path}`)?.groupId;
+      expect(groupOf("/scripted"), JSON.stringify(tabs)).toBe(groupOf("/"));
+      expect(groupOf("/linked"), JSON.stringify(tabs)).toBe(groupOf("/"));
+      await Promise.all([scripted.close(), linked.close()]); // and can close them
+    } finally {
+      await browser.close();
+      server.close();
+    }
+  }, 60_000);
+
   it("refuses to hand one chat's tab to another chat", async () => {
     const cdp = (client: string) => chromium.connectOverCDP(`ws://127.0.0.1:${daemon.port}/cdp/pw-test?client=${client}`);
     const [a, b] = [await cdp("ADOPT_A"), await cdp("ADOPT_B")];

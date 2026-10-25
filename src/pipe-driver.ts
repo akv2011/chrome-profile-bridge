@@ -13,7 +13,7 @@ import type { RelayTabInfo } from "./relay-protocol.ts";
 
 const log = createLogger("pipe-driver");
 
-type PageTarget = { targetId: string; url: string; title: string };
+type PageTarget = { targetId: string; url: string; title: string; openerId?: string };
 
 // Tab and group ids are per daemon, not per driver. A profile's driver is rebuilt whenever Chrome
 // unloads and reopens the profile (its last window closed), while the bridge keeps its chats and their
@@ -93,13 +93,13 @@ export function drivePipeProfile(opts: {
 
   async function pageTargets(): Promise<PageTarget[]> {
     const { targetInfos } = (await pipe.send("Target.getTargets", {}, undefined, 10_000)) as {
-      targetInfos: Array<{ targetId: string; type: string; url: string; title: string; browserContextId?: string }>;
+      targetInfos: Array<{ targetId: string; type: string; url: string; title: string; browserContextId?: string; openerId?: string }>;
     };
     // Hide blank new-tab pages (the one a daemon-opened window starts with, until it is closed, and
     // any of the user's own); the agent should not see or drive them.
     return targetInfos
       .filter((t) => t.type === "page" && t.browserContextId === contextId && !/^chrome:\/\/(new-?tab|newtab)/.test(t.url) && !t.url.startsWith(LAUNCH_MARKER))
-      .map((t) => ({ targetId: t.targetId, url: t.url, title: t.title }));
+      .map((t) => ({ targetId: t.targetId, url: t.url, title: t.title, openerId: t.openerId }));
   }
 
   /** Current tabs the bridge should see: every page in this profile's context, with a stable tabId. */
@@ -117,9 +117,18 @@ export function drivePipeProfile(opts: {
     }
     const listed = new Set(pages.map((p) => p.targetId));
     const out = pages.map((p) => {
+      const openerTabId = p.openerId ? tabIdOf(p.openerId) : undefined;
       let tabId = tabIdOf(p.targetId);
-      if (tabId === undefined) { tabId = nextTab++; byTab.set(tabId, p.targetId); }
-      return { tabId, url: p.url, title: p.title, active: false, groupId: group.get(tabId) ?? -1, targetId: p.targetId };
+      if (tabId === undefined) {
+        tabId = nextTab++;
+        byTab.set(tabId, p.targetId);
+        // A page's popup (window.open, target=_blank) joins its opener's chat, as in extension mode.
+        // Without this a popup (an ad script's, or a results page opened in a new tab) sat in no group,
+        // where the chat that opened it could not see, attach or close it.
+        const openerGroup = openerTabId === undefined ? undefined : group.get(openerTabId);
+        if (openerGroup !== undefined) group.set(tabId, openerGroup);
+      }
+      return { tabId, url: p.url, title: p.title, active: false, groupId: group.get(tabId) ?? -1, targetId: p.targetId, ...(openerTabId === undefined ? {} : { openerTabId }) };
     });
     // Include just-created tabs that Target.getTargets has not listed yet, so the bridge keeps them.
     for (const [tabId, tid] of byTab) {

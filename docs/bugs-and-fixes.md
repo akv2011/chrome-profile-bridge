@@ -5,6 +5,12 @@ recurring theme in the full-CDP (pipe) path is Chrome's browser-context lifecycl
 not durable, it dies when a profile's last window closes, and the daemon must never treat a cached
 or in-use context id as permanent.
 
+## Popups left their chat (2026-10-25)
+
+| Symptom | Cause | Fix | Commit |
+|---|---|---|---|
+| A tab a chat's page opened showed up in `Bridge.listAllTabs` with groupId -1, and that chat could not list, attach or close it ("No target with given id found"): an ad script's popup, a search results page opened in a new tab | The tab was a popup (`window.open` or a `target=_blank` link) of the chat's page, a new target. The extension puts a popup in its opener's group (`chrome.tabs.onCreated`); the full-CDP driver gave every new target a tabId and no group, so it belonged to no chat and Playwright never emitted `popup`. A prerender activation and a cross-site redirect keep the target and its group (checked) | The driver puts a new target whose `openerId` is one of its tabs into that tab's group and reports `openerTabId`, so the chat auto-attaches it and Playwright emits `popup` (CDP reports the opener even for noopener `_blank` links). `pipe.e2e` "gives a chat the popups its pages open": timed out waiting for `popup` on the old code, passes in 0.6 s now | driver |
+
 ## Only the last-used profile takes new tabs (2026-10-23)
 
 | Symptom | Cause | Fix | Commit |
