@@ -6,6 +6,6 @@
   "description": "A local daemon + Chrome extension that lets CDP clients (Playwright, Claude Code, MCP) drive your real signed-in Chrome profiles with full DevTools access, no approval prompts, each client isolated in its own tab group.",
   "engines": { "node": ">=24" },
   "scripts": { "test": "vitest run", "start": "node src/daemon.ts" },
-  "dependencies": { "ws": "8.22.0" },
-  "devDependencies": { "playwright-core": "1.64.1", "vitest": "5.0.5", "@playwright/mcp": "0.0.82" }
+  "dependencies": { "playwright-core": "1.64.1", "ws": "8.22.0" },
+  "devDependencies": { "vitest": "5.0.5", "@playwright/mcp": "0.0.82" }
 }

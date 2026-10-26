@@ -217,6 +217,9 @@ describe("daemon end to end with real Playwright", () => {
   it("fanout runs a snippet across profiles and isolates failures", async () => {
     const ok = await fanout({ names: ["pw-test"], url: stack.siteUrl, expression: "document.title", port: stack.daemon.port });
     expect(ok).toEqual([{ name: "pw-test", value: "Bridge test" }]);
+    // The tab it opened is closed, not left in the profile for the 10-minute reconnect window.
+    const status = (await (await fetch(`http://127.0.0.1:${stack.daemon.port}/status`)).json()) as { profiles: Record<string, { chats?: Array<{ key: string; tabs: number }> }> };
+    expect(status.profiles["pw-test"].chats?.find((c) => c.key === "fanout-pw-test")?.tabs ?? 0).toBe(0);
     const mixed = await fanout({ names: ["pw-test", "pw-nope"], expression: "1+1", port: stack.daemon.port });
     expect(mixed.find((r) => r.name === "pw-test")?.value).toBe(2);
     expect(mixed.find((r) => r.name === "pw-nope")?.error).toBeTruthy();

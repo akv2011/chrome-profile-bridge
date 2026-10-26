@@ -40,6 +40,27 @@ daemon per machine that holds a single extension socket per profile and serves C
 - Raw CDP clients (not Playwright): `Target.getTargets` lists only the tabs this chat has attached, so
   send `Target.setAutoAttach` first, as Playwright does.
 
+### Without MCP (a script or a shell)
+
+The pw-* tools are one client of the daemon. Any CDP client on the same machine can drive a profile
+directly at `ws://127.0.0.1:18765/cdp/<pw-name>?client=<key>`: same signed-in profile, full CDP,
+`Bridge.*` included. The key names your tab group, and connecting again with it gets your tabs back.
+Close every tab you open: a disconnect alone leaves it in the profile for 10 minutes.
+
+```js
+// playwright-core is installed in the app copy by bin/ship.sh; replace <you> with your user name.
+import { chromium } from "/Users/<you>/.claude-browser-bridge/app/node_modules/playwright-core/index.mjs";
+const browser = await chromium.connectOverCDP("ws://127.0.0.1:18765/cdp/pw-work?client=my-script");
+const page = await browser.contexts()[0].newPage();
+await page.goto("https://example.com");
+const cdp = await page.context().newCDPSession(page); // Bridge.* methods work here too
+console.log(await page.title(), await cdp.send("Bridge.health"));
+await page.close();
+await browser.close();
+```
+
+Python Playwright works the same way: `p.chromium.connect_over_cdp("ws://127.0.0.1:18765/cdp/pw-work?client=my-script")`.
+
 ## Agent methods (`Bridge.*`)
 
 Call these over the page's CDP session (`page.context().newCDPSession(page).send("Bridge.x", …)`). They add the agent layer on top of raw CDP:
@@ -59,7 +80,7 @@ Call these over the page's CDP session (`page.context().newCDPSession(page).send
 | `Bridge.saveSecret { service, account, value? }` / `Bridge.typeSecret { id, service, account }` | Save a credential (or generate one the agent never sees) and type it into a field, for sign-up and auto-fill. The value never crosses the wire. |
 | `Bridge.record { name }` / `Bridge.stopRecording` / `Bridge.replay { name }` | Capture a flow (navigations + acts by role+name) and rerun it deterministically. |
 
-Across profiles: `bin/cbb-fanout <name…> [--url <url>] -- "<expression>"` runs one snippet on several profiles at once and prints one result each.
+Across profiles: `cbb-fanout <name…> [--url <url>] -- "<expression>"` runs one snippet on several profiles at once and prints one result each (bin/ship.sh links it into `~/.local/bin`).
 
 ## Two modes
 

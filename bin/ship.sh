@@ -14,6 +14,10 @@ if ! cmp -s "$SRC/package-lock.json" "$APP/package-lock.json"; then
   cp "$SRC/package.json" "$SRC/package-lock.json" "$APP/"
   (cd "$APP" && PATH=/opt/homebrew/bin:$PATH npm ci --omit=dev --no-audit --no-fund --loglevel=error)
 fi
+# cbb-fanout runs here, where the daemon is: the repo's node_modules on this Mac lack its playwright-core.
+mkdir -p "$APP/bin" "$HOME/.local/bin"
+install -m 755 "$SRC/bin/cbb-fanout" "$APP/bin/cbb-fanout"
+ln -sf "$APP/bin/cbb-fanout" "$HOME/.local/bin/cbb-fanout"
 # VERSION is a hash of what was shipped, not the commit, so a commit that only touches docs or the
 # installer leaves it unchanged and the daemon does not restart for nothing.
 find "$APP/src" "$APP/package-lock.json" "$EXT" -type f -print0 2>/dev/null | sort -z | xargs -0 shasum -a 256 \
