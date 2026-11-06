@@ -36,7 +36,7 @@ beforeAll(async () => {
   }
   home = fs.mkdtempSync(path.join(os.tmpdir(), "cbb-prof-home-"));
   udd = fs.mkdtempSync(path.join(os.tmpdir(), "cbb-prof-udd-"));
-  fs.writeFileSync(path.join(home, "profiles.json"), JSON.stringify({ "pw-a": "Default", "pw-b": "Profile 2", "pw-c": "Profile 3" }));
+  fs.writeFileSync(path.join(home, "profiles.json"), JSON.stringify({ "pw-a": "Default", "pw-b": "Profile 2", "pw-c": "Profile 3", "pw-d": "Profile 4" }));
   daemon = await startDaemon({
     port: 0,
     extensionDir: path.join(import.meta.dirname, "..", "extension"),
@@ -72,6 +72,7 @@ describe("several profiles in one Chrome", () => {
   }, 120_000);
 
   it("gives a new chat a working page after its profile's window closed and reopened", async () => {
+    process.env.CBB_WARM_MS = "0"; // no warm spare, so closing the only tab unloads the profile
     const cdp = (client: string) => chromium.connectOverCDP(`ws://127.0.0.1:${daemon.port}/cdp/pw-c?client=${client}`);
     const first = await cdp("REOPEN_1");
     const page1 = await first.contexts()[0].newPage();
@@ -88,6 +89,32 @@ describe("several profiles in one Chrome", () => {
       const page2 = await second.contexts()[0].newPage();
       await page2.goto("data:text/html,<title>second</title>");
       expect(await page2.title()).toBe("second");
+    } finally {
+      delete process.env.CBB_WARM_MS;
+      await second.close();
+    }
+  }, 60_000);
+
+  it("keeps a profile warm after an agent closes its only tab, so the next agent reuses it", async () => {
+    const cdp = (client: string) => chromium.connectOverCDP(`ws://127.0.0.1:${daemon.port}/cdp/pw-d?client=${client}`);
+    const targetOf = async (page: import("playwright-core").Page) =>
+      ((await (await page.context().newCDPSession(page)).send("Target.getTargetInfo")) as { targetInfo: { targetId: string } }).targetInfo.targetId;
+    const first = await cdp("WARM_1");
+    const page1 = await first.contexts()[0].newPage();
+    await page1.goto("data:text/html,<title>first</title>");
+    const firstTarget = await targetOf(page1);
+    await page1.close(); // the profile's only tab: before the warm spare, Chrome unloaded the profile here
+    expect(page1.isClosed()).toBe(true);
+    await first.close();
+    await new Promise((r) => setTimeout(r, 3_000)); // longer than an unload takes
+
+    const second = await cdp("WARM_2");
+    try {
+      expect(second.contexts()[0].pages()).toHaveLength(0); // the spare is hidden from agents
+      const page2 = await second.contexts()[0].newPage();
+      await page2.goto("data:text/html,<title>second</title>");
+      expect(await page2.title()).toBe("second");
+      expect(await targetOf(page2)).toBe(firstTarget); // same tab, reused: no relaunch of the profile
     } finally {
       await second.close();
     }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // browserbench flow against the bridge: node bench/browserbench.mjs [runs=50] [profile=pw-work]. Run on the Mac (the daemon is loopback).
+// Runs whose page open takes over 1 s are printed to stderr with their time, to line up with daemon.log.
 // Same flow as Steel's browserbench: connect -> goto google.com (domcontentloaded) -> release. "Create" is 0: the profile already runs.
 // playwright-core comes from the installed app copy, which bin/ship.sh keeps.
 const { chromium } = await import(`${process.env.HOME}/.claude-browser-bridge/app/node_modules/playwright-core/index.mjs`);
@@ -15,6 +16,7 @@ for (let i = 0; i < N; i++) {
       await page.goto("https://www.google.com/", { waitUntil: "domcontentloaded", timeout: 25000 }); t2 = performance.now();
       await page.close(); await browser.close(); t3 = performance.now();
     })(), 30000);
+    if (t2 - tN > 1000) console.error(JSON.stringify({ i, at: new Date().toISOString(), nav: Math.round(t2 - tN), url: page.url() }));
     rows.push({ connect: t1 - t0, newtab: tN - t1, nav: t2 - tN, goto: t2 - t1, release: t3 - t2, total: t3 - t0 });
   } catch (e) {
     fails.push({ i, at: t2 ? "release" : t1 ? "goto" : "connect", err: e.message.split("\n")[0].slice(0, 90) });

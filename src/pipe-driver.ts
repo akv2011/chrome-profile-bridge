@@ -25,6 +25,11 @@ let nextGroup = 1;
 /** URL prefix of the tab the daemon opens through Chrome's command line; hidden until a chat uses it. */
 export const LAUNCH_MARKER = "data:text/html,<title>cbb-";
 
+/** How long a profile's last agent tab stays open, blanked, as the next tab after an agent closes it.
+ *  CBB_WARM_MS overrides it (tests set 0 to reach the unload-and-reopen path). */
+const warmMs = () => Number(process.env.CBB_WARM_MS ?? 3 * 60_000);
+const WARM_URL = `${LAUNCH_MARKER}warm</title>`;
+
 /** Attach one profile to the bridge, driven by the shared pipe and scoped to `contextId`. */
 export function drivePipeProfile(opts: {
   bridge: ExtensionRelayBridge;
@@ -48,6 +53,7 @@ export function drivePipeProfile(opts: {
   const { bridge, pipe, email, browserVersion } = opts;
   let contextId = opts.contextId; // mutable: openTab may rebind it to a fresh context
   const strays = [...(opts.strayNewTabs ?? [])];
+  const blanking = new Map<string, Promise<boolean>>(); // warm tab -> its blanking navigation
   const byTab = new Map<number, string>(); // tabId -> targetId
   const group = new Map<number, number>(); // tabId -> logical groupId
   const createdAt = new Map<number, number>(); // tabId -> ms, to spare a just-created tab from pruning
@@ -66,7 +72,8 @@ export function drivePipeProfile(opts: {
    *  launch goes first, and a refused createTarget opens one by launch, which works for any profile. */
   async function createInContext(url: string): Promise<string> {
     const spare = strays.shift();
-    if (spare && (await navigate(spare, url))) return spare;
+    // A warm tab still blanking must finish first, or the blank page could land over the chat's URL.
+    if (spare && (await (blanking.get(spare) ?? true)) && (await navigate(spare, url))) return spare;
     try {
       return ((await pipe.send("Target.createTarget", { url, browserContextId: contextId }, undefined, 20_000)) as { targetId: string }).targetId;
     } catch (err) {
@@ -77,6 +84,31 @@ export function drivePipeProfile(opts: {
       contextId = opened.contextId;
       return opened.targetId;
     }
+  }
+
+  // Closing a profile's last page makes Chrome unload the profile, so the next connect reopened it by
+  // launch: 0.6-2.4 s, the whole slow tail of a browserbench run. The last tab is instead hidden
+  // at once (the chat sees it close), blanked, and kept as the next tab for warmMs(), like a cloud
+  // provider's warm pool. Any other page in the context, such as the user's own window, means closing
+  // costs nothing later, so it closes.
+  async function closeTarget(tid: string): Promise<void> {
+    const others = (await pipe.pageTargets().catch(() => [])).filter((p) => p.browserContextId === contextId && p.targetId !== tid);
+    if (others.length) return void (await pipe.send("Target.closeTarget", { targetId: tid }).catch(() => {}));
+    strays.push(tid);
+    blanking.set(
+      tid,
+      navigate(tid, WARM_URL).then((ok) => {
+        blanking.delete(tid);
+        if (!ok && strays.includes(tid)) strays.splice(strays.indexOf(tid), 1);
+        return ok;
+      }),
+    );
+    setTimeout(() => {
+      const i = strays.indexOf(tid);
+      if (i < 0) return; // a new tab took it
+      strays.splice(i, 1);
+      void pipe.send("Target.closeTarget", { targetId: tid }).catch(() => {});
+    }, warmMs()).unref();
   }
 
   /** Point a tab the daemon opened at the chat's URL. False if the tab is gone. */
@@ -98,7 +130,7 @@ export function drivePipeProfile(opts: {
     // Hide blank new-tab pages (the one a daemon-opened window starts with, until it is closed, and
     // any of the user's own); the agent should not see or drive them.
     return targetInfos
-      .filter((t) => t.type === "page" && t.browserContextId === contextId && !/^chrome:\/\/(new-?tab|newtab)/.test(t.url) && !t.url.startsWith(LAUNCH_MARKER))
+      .filter((t) => t.type === "page" && t.browserContextId === contextId && !/^chrome:\/\/(new-?tab|newtab)/.test(t.url) && !t.url.startsWith(LAUNCH_MARKER) && !strays.includes(t.targetId))
       .map((t) => ({ targetId: t.targetId, url: t.url, title: t.title, openerId: t.openerId }));
   }
 
@@ -192,9 +224,9 @@ export function drivePipeProfile(opts: {
           for (const [tabId, g] of [...group]) {
             if (g !== gid) continue;
             const tid = byTab.get(tabId);
-            if (tid) await pipe.send("Target.closeTarget", { targetId: tid }).catch(() => {});
             byTab.delete(tabId);
             group.delete(tabId);
+            if (tid) await closeTarget(tid);
           }
           reply(seq, {});
           pushTabs();
@@ -202,9 +234,9 @@ export function drivePipeProfile(opts: {
         }
         case "closeTab": {
           const tid = targetId(msg.tabId as number);
-          if (tid) await pipe.send("Target.closeTarget", { targetId: tid }).catch(() => {});
           byTab.delete(msg.tabId as number);
           group.delete(msg.tabId as number);
+          if (tid) await closeTarget(tid);
           reply(seq, {});
           pushTabs();
           return;
