@@ -299,11 +299,6 @@ async function handle(msg) {
         await detachDebugger(msg.tabId);
         await chrome.tabs.remove(msg.tabId);
         break;
-      case "activateTab": {
-        const tab = await chrome.tabs.update(msg.tabId, { active: true });
-        await chrome.windows.update(tab.windowId, { focused: true });
-        break;
-      }
       case "listAllTabs": {
         await ready;
         const tabs = await chrome.tabs.query({});

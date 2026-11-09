@@ -3,7 +3,7 @@
  * Target.createTarget finds a regular profile's context only while it is the last-used profile, so a
  * chat on the other profile must still get its tab, in the right profile, without a slow relaunch.
  * Headful because a headless Chrome never hands a second launch to the running one. On Linux without
- * a display it starts Xvfb.
+ * a display it starts Xvfb and openbox.
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import fs from "node:fs";
@@ -18,6 +18,7 @@ let daemon: Awaited<ReturnType<typeof startDaemon>>;
 let home = "";
 let udd = "";
 let xvfb: ChildProcess | undefined;
+let wm: ChildProcess | undefined;
 const servers: ChildProcess[] = [];
 
 const mcp = (name: string, client: string) => mcpClient(`ws://127.0.0.1:${daemon.port}/cdp/${name}?client=${client}`, servers);
@@ -33,6 +34,10 @@ beforeAll(async () => {
     process.env.DISPLAY = `:${90 + Math.floor(Math.random() * 100)}`;
     xvfb = spawn("Xvfb", [process.env.DISPLAY, "-screen", "0", "1280x800x24"], { stdio: "ignore" });
     await new Promise((r) => setTimeout(r, 1_000));
+    // A window manager, so Chrome has an active window as on a desktop. Without one Chrome sees no
+    // activated window and opens every new tab in a new window, which hides focus bugs.
+    wm = spawn("openbox", [], { stdio: "ignore" });
+    await new Promise((r) => setTimeout(r, 500));
   }
   home = fs.mkdtempSync(path.join(os.tmpdir(), "cbb-prof-home-"));
   udd = fs.mkdtempSync(path.join(os.tmpdir(), "cbb-prof-udd-"));
@@ -48,6 +53,7 @@ beforeAll(async () => {
 afterAll(async () => {
   for (const p of servers) p.kill();
   await daemon?.close();
+  wm?.kill();
   xvfb?.kill();
   fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   fs.rmSync(udd, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
@@ -117,6 +123,52 @@ describe("several profiles in one Chrome", () => {
       expect(await targetOf(page2)).toBe(firstTarget); // same tab, reused: no relaunch of the profile
     } finally {
       await second.close();
+    }
+  }, 60_000);
+
+  it("opens an agent's tab behind the user's, and the agent can still click in it", async () => {
+    // The user's tab over raw CDP: Playwright turns on focus emulation, which reports every tab it
+    // drives as visible, so only an unemulated tab shows whether it is still in front.
+    const ws = new WebSocket(`ws://127.0.0.1:${daemon.port}/cdp/pw-a?client=USER_TAB`);
+    await new Promise((r, j) => ((ws.onopen = r), (ws.onerror = j)));
+    let seq = 0;
+    const pending = new Map<number, (v: { result?: Record<string, unknown> }) => void>();
+    let attached: (sessionId: string) => void = () => {};
+    ws.onmessage = (e) => {
+      const m = JSON.parse(String(e.data));
+      if (m.id) pending.get(m.id)?.(m);
+      if (m.method === "Target.attachedToTarget" && m.params.targetInfo.type === "page") attached(m.params.sessionId);
+    };
+    const send = (method: string, params = {}, sessionId?: string) =>
+      new Promise<{ result?: Record<string, unknown> }>((r) => {
+        pending.set(++seq, r);
+        ws.send(JSON.stringify({ id: seq, method, params, ...(sessionId ? { sessionId } : {}) }));
+      });
+    const agent = await chromium.connectOverCDP(`ws://127.0.0.1:${daemon.port}/cdp/pw-a?client=AGENT_TAB`);
+    try {
+      await send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
+      const session = new Promise<string>((r) => (attached = r));
+      await send("Target.createTarget", { url: "data:text/html,<title>user</title>" });
+      const userSession = await session;
+      const visible = async () =>
+        ((await send("Runtime.evaluate", { expression: "document.visibilityState", returnByValue: true }, userSession)).result as { result: { value: string } }).result.value;
+      expect(await visible()).toBe("visible");
+
+      // Before 11-10 the agent's tab opened in front: Chrome switched the user's window to it and, on
+      // macOS, pulled Chrome in front of the app the user was in, once per new agent tab.
+      const page = await agent.contexts()[0].newPage();
+      expect(await visible()).toBe("visible");
+      await page.goto(`data:text/html,<button onclick="document.title='clicked'">b</button><input id=i>`);
+      await page.click("button", { timeout: 5_000 });
+      await page.fill("#i", "typed", { timeout: 5_000 });
+      expect(await page.title()).toBe("clicked");
+      expect(await page.inputValue("#i")).toBe("typed");
+      // An agent's bringToFront would pull the window forward the same way, so it must not move the user.
+      await page.bringToFront();
+      expect(await visible()).toBe("visible");
+    } finally {
+      await agent.close();
+      ws.close();
     }
   }, 60_000);
 });

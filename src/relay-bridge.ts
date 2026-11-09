@@ -903,6 +903,7 @@ export class ExtensionRelayBridge {
       this.respondError(client, request, `Session not found: ${sessionId}`, -32001);
       return;
     }
+    if (request.method === "Page.bringToFront") return this.respond(client, request, {}); // see Target.activateTarget
     const result = await this.execCdp(route.tabId, route.child ? sessionId : undefined, request.method, request.params);
     this.respond(client, request, result);
   }
@@ -1082,9 +1083,10 @@ export class ExtensionRelayBridge {
         return;
       }
       case "Target.activateTarget": {
+        // Never focus: the user shares this browser, and activating raises its window over whatever
+        // they are doing. An agent's tab works in the background (Page.bringToFront is the same).
         const found = this.ownedTabByTargetId(client, request.params?.targetId as string);
         if (!found) return this.notFound(client, request, request.params?.targetId);
-        await this.callExtension({ type: "activateTab", tabId: found.tabId });
         this.respond(client, request, {});
         return;
       }

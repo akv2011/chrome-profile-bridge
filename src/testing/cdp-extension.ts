@@ -99,8 +99,6 @@ export async function startCdpExtension(opts: { daemonPort: number; origin: stri
         }
         toDaemon({ type: "tabs", tabs: grouped() });
         return {};
-      case "activateTab":
-        return {};
       case "groupTab": {
         const tab = tabs.get(msg.tabId);
         if (!tab) throw new Error(`no tab ${msg.tabId}`);

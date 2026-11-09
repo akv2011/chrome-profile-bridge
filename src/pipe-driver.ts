@@ -75,7 +75,9 @@ export function drivePipeProfile(opts: {
     // A warm tab still blanking must finish first, or the blank page could land over the chat's URL.
     if (spare && (await (blanking.get(spare) ?? true)) && (await navigate(spare, url))) return spare;
     try {
-      return ((await pipe.send("Target.createTarget", { url, browserContextId: contextId }, undefined, 20_000)) as { targetId: string }).targetId;
+      // background: a foreground tab switched the user's window to it and, on macOS, pulled Chrome in
+      // front of the app the user was in, once per agent tab (11-10). Like the extension's active: false.
+      return ((await pipe.send("Target.createTarget", { url, browserContextId: contextId, background: true }, undefined, 20_000)) as { targetId: string }).targetId;
     } catch (err) {
       if (!opts.openTab || !String(err).includes("Failed to find browser context")) throw err;
       const opened = await opts.openTab();
@@ -239,12 +241,6 @@ export function drivePipeProfile(opts: {
           if (tid) await closeTarget(tid);
           reply(seq, {});
           pushTabs();
-          return;
-        }
-        case "activateTab": {
-          const tid = targetId(msg.tabId as number);
-          if (tid) await pipe.send("Target.activateTarget", { targetId: tid }).catch(() => {});
-          reply(seq, {});
           return;
         }
         case "listAllTabs":

@@ -108,8 +108,6 @@ export type RelayCommandBody =
   | { type: "closeGroup"; groupId: number }
   /** Close one tab. Result: {}. */
   | { type: "closeTab"; tabId: number }
-  /** Focus a tab (window + tab activation). Result: {}. */
-  | { type: "activateTab"; tabId: number }
   /** Every tab in the profile, grouped or not. Result: { tabs: RelayTabInfo[] }. */
   | { type: "listAllTabs" }
   /** Reload the extension so it runs the files now on disk. Result: {}. */
