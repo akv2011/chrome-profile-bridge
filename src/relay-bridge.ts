@@ -24,6 +24,14 @@ import {
 
 const log = createLogger("bridge");
 
+/** Calls that log the user out of their real profile, whatever the agent meant: every site's cookies, or
+ *  a site's data with its cookies. Playwright's context.clearCookies() is Storage.clearCookies. Clearing
+ *  cache stays allowed: it loses no login and is how a cached bad response gets fixed. */
+const wipesLogins = (method: string, params?: Record<string, unknown>): boolean =>
+  method === "Storage.clearCookies" ||
+  method === "Network.clearBrowserCookies" ||
+  ((method === "Storage.clearDataForOrigin" || method === "Storage.clearDataForStorageKey") && /\b(all|cookies)\b/.test(String(params?.storageTypes ?? "")));
+
 const EXTENSION_COMMAND_TIMEOUT_MS = 15_000;
 /** Message traffic keeps the MV3 service worker alive; Chrome idles it after 30 s of silence. */
 const EXTENSION_PING_INTERVAL_MS = 20_000;
@@ -876,6 +884,10 @@ export class ExtensionRelayBridge {
   private async handleCdpRequest(client: CdpClientState, request: CdpRequest): Promise<void> {
     try {
       await this.waitForExtension();
+      if (wipesLogins(request.method, request.params)) {
+        this.respondError(client, request, `${request.method} refused: it would log the user out of sites in their real browser profile`);
+        return;
+      }
       if (request.sessionId && this.browserSessions.get(request.sessionId) !== client) {
         await this.handleSessionScopedRequest(client, request);
         return;
@@ -1102,12 +1114,6 @@ export class ExtensionRelayBridge {
       case "Storage.setCookies": {
         const tabId = await this.anyTabOf(client);
         await this.execCdp(tabId, undefined, "Network.setCookies", { cookies: request.params?.cookies ?? [] });
-        this.respond(client, request, {});
-        return;
-      }
-      case "Storage.clearCookies": {
-        const tabId = await this.anyTabOf(client);
-        await this.execCdp(tabId, undefined, "Network.clearBrowserCookies");
         this.respond(client, request, {});
         return;
       }

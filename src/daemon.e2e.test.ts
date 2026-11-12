@@ -192,6 +192,21 @@ describe("daemon end to end with real Playwright", () => {
     expect(JSON.stringify(saved) + JSON.stringify(typed)).not.toContain(value); // value never crossed the wire
   }, 60_000);
 
+  it("refuses CDP calls that would wipe the profile's logins or site data", async () => {
+    const browser = await connect("E2E_WIPE");
+    const context = browser.contexts()[0];
+    const page = await context.newPage();
+    await page.goto(stack.siteUrl);
+    await page.evaluate(() => (document.cookie = "login=kept; max-age=600"));
+    // Playwright's clearCookies() clears the whole profile: every site the user is signed in to.
+    await expect(context.clearCookies()).rejects.toThrow(/refused/);
+    const cdp = await context.newCDPSession(page);
+    for (const method of ["Network.clearBrowserCookies", "Storage.clearDataForOrigin"]) {
+      await expect(cdp.send(method as "Network.enable", { origin: stack.siteUrl.slice(0, -1), storageTypes: "all" } as object)).rejects.toThrow(/refused/);
+    }
+    expect(await page.evaluate(() => document.cookie)).toContain("login=kept");
+  }, 60_000);
+
   it("Bridge.extract returns in-page data as JSON", async () => {
     const browser = await connect("E2E_EXTRACT");
     const context = browser.contexts()[0];
