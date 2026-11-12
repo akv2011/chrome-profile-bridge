@@ -143,10 +143,12 @@ class PipeBackend implements CdpExecBackend {
     }
     await this.pipe.detach(session);
   }
-  cdp(tabId: number, _sessionId: string | undefined, method: string, params?: unknown): Promise<unknown> {
+  cdp(tabId: number, sessionId: string | undefined, method: string, params?: unknown): Promise<unknown> {
     const session = this.sessions.get(tabId);
     if (!session) return Promise.reject(new Error(`tab ${tabId} is not attached on the pipe`));
-    return this.pipe.send(method, (params as Record<string, unknown>) ?? {}, session);
+    // A child session (worker, cross-site iframe) the relay already matched to this tab: Chrome's own
+    // session id, so the command goes there. Sent to the page instead, a worker's resume never reached it.
+    return this.pipe.send(method, (params as Record<string, unknown>) ?? {}, sessionId ?? session);
   }
 }
 
@@ -157,10 +159,11 @@ export async function startDaemon(opts: DaemonOptions) {
   const lastOpened = new Map<string, number>();
 
   // Full-CDP mode: one trusted pipe to the whole browser. A tab's CDP events route back to its
-  // bridge by the real targetId the extension reports; iframe child targets are not tabs, so
-  // their events are dropped here (page-level domains, the ones Chrome blocks the extension from,
-  // all ride the page session).
+  // bridge by the real targetId the extension reports. Workers and cross-site iframes Chrome
+  // auto-attaches under a tab are child sessions: their events go to the owner tab as that child
+  // session, which the client resumes (Playwright attaches them paused).
   const targetRegistry = new Map<string, { bridge: ExtensionRelayBridge; tabId: number }>();
+  const childOwners = new Map<string, { bridge: ExtensionRelayBridge; tabId: number }>();
   const drivers = new Map<string, ReturnType<typeof drivePipeProfile>>();
   const ensuring = new Map<string, Promise<void>>();
   let pipe: ChromePipe | null = null;
@@ -170,9 +173,14 @@ export async function startDaemon(opts: DaemonOptions) {
       userDataDir: opts.pipe.userDataDir,
       extraArgs: opts.pipe.extraArgs,
       socketPath: opts.pipe.socketPath,
-      onEvent: ({ targetId, method, params }) => {
-        const entry = targetRegistry.get(targetId);
-        if (entry) entry.bridge.injectCdpEvent(entry.tabId, undefined, method, params);
+      onEvent: ({ targetId, sessionId, method, params }) => {
+        const root = targetRegistry.get(targetId);
+        const entry = root ?? (sessionId ? childOwners.get(sessionId) : undefined);
+        if (!entry) return;
+        const child = (params as { sessionId?: unknown } | undefined)?.sessionId;
+        if (method === "Target.attachedToTarget" && typeof child === "string") childOwners.set(child, entry);
+        if (method === "Target.detachedFromTarget" && typeof child === "string") childOwners.delete(child);
+        entry.bridge.injectCdpEvent(entry.tabId, root ? undefined : sessionId, method, params);
       },
       onTargetEvent: (e) => {
         for (const d of drivers.values()) d.onTargetEvent(e);

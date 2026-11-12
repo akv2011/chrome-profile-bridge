@@ -61,6 +61,18 @@ await browser.close();
 
 Python Playwright works the same way: `p.chromium.connect_over_cdp("ws://127.0.0.1:18765/cdp/pw-work?client=my-script")`.
 
+**Bot-checked sites: use [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) instead of Playwright**
+(same API). Stock Playwright turns on CDP `Runtime`, which pages detect (rebrowser's `runtimeEnableLeak`), and
+runs `evaluate` where the page can watch it. JS: import `chromium` from the app's
+`node_modules/patchright-core/index.mjs`. Python: `pip install patchright`, `from patchright.async_api import
+async_playwright`. `evaluate` then runs in an isolated world (DOM yes, page JS globals no); for the page's own
+globals pass the main world: JS `page.evaluate(fn, arg, undefined, false)`, Python `page.evaluate(js,
+isolated_context=False)`. Console events are off under Patchright, so the pw-* MCP stays on stock Playwright.
+
+Every client gets human-like input from the relay (curved pointer paths, held presses, paced keys, gliding
+scroll; ported from [anomalyco/browse](https://github.com/anomalyco/browse), MIT). `CBB_HUMAN_INPUT=0` in the
+daemon's environment turns it off.
+
 ## Agent methods (`Bridge.*`)
 
 Call these over the page's CDP session (`page.context().newCDPSession(page).send("Bridge.x", …)`). They add the agent layer on top of raw CDP:

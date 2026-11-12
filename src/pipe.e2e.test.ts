@@ -1,5 +1,6 @@
 import type { ChildProcess } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { chromium } from "playwright-core";
@@ -121,6 +122,35 @@ describe("no-extension pipe mode", () => {
     } finally {
       await browser.close();
       server.close();
+    }
+  }, 60_000);
+
+  it("runs a page's Web Workers and cross-site iframes (they start paused under auto-attach)", async () => {
+    // Playwright auto-attaches workers and cross-site iframes paused and resumes each on its own child session.
+    // The pipe backend sent that resume to the page instead, so workers never started and cross-site iframes
+    // (Cloudflare's Turnstile box among them) never loaded in an agent tab.
+    const site = http.createServer((req, res) => {
+      res.setHeader("content-type", "text/html");
+      res.end(req.url === "/inner" ? "<title>inner</title><p id=p>inner loaded</p>" : "<title>outer</title>");
+    });
+    await new Promise<void>((r) => site.listen(0, "127.0.0.1", r));
+    const port = (site.address() as { port: number }).port;
+    const browser = await chromium.connectOverCDP(`ws://127.0.0.1:${daemon.port}/cdp/pw-test?client=PIPE_WORKER`);
+    try {
+      const page = await browser.contexts()[0].newPage();
+      await page.goto(`http://127.0.0.1:${port}/`);
+      const worker = await page.evaluate(() => new Promise((res) => {
+        const w = new Worker(URL.createObjectURL(new Blob(["postMessage('ran')"], { type: "text/javascript" })));
+        w.onmessage = (e) => res(e.data);
+        setTimeout(() => res("timeout"), 4_000);
+      }));
+      expect(worker).toBe("ran");
+      // localhost is another site than 127.0.0.1, so this iframe runs in its own process.
+      await page.evaluate((src) => document.body.insertAdjacentHTML("beforeend", `<iframe src="${src}"></iframe>`), `http://localhost:${port}/inner`);
+      await expect.poll(() => page.frames().find((f) => f.url().includes("/inner"))?.textContent("#p", { timeout: 2_000 }).catch(() => null), { timeout: 8_000 }).toBe("inner loaded");
+    } finally {
+      await browser.close();
+      site.close();
     }
   }, 60_000);
 

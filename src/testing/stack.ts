@@ -29,6 +29,21 @@ export async function startStack() {
       res.writeHead(200, { "Content-Type": "application/json" }).end('{"ok":true}');
       return;
     }
+    if (req.url === "/state") {
+      // A page whose own script keeps state in a JS global and logs, as most apps do.
+      res.writeHead(200, { "Content-Type": "text/html" }).end(`<title>State</title><script>window.appState = { n: 42 }; console.log("hello-console");</script>`);
+      return;
+    }
+    if (req.url === "/leak") {
+      // The runtimeEnableLeak check bot vendors run (rebrowser's, Chrome 137+): with CDP Runtime enabled,
+      // logging an Error reads its name 3 times instead of once. Checked again after the agent's commands.
+      res.writeHead(200, { "Content-Type": "text/html" }).end(`<title>clean</title><script>
+        let reads = 0, rounds = 0;
+        class Probe extends Error { get name() { reads++; return "Probe"; } }
+        setInterval(() => { rounds++; console.debug(new Probe("x")); if (reads / rounds > 1.5) document.title = "automation seen"; }, 100);
+      </script>`);
+      return;
+    }
     if (req.url === "/download") {
       res.writeHead(200, { "Content-Type": "text/plain", "Content-Disposition": 'attachment; filename="f.txt"' }).end("bridge download");
       return;

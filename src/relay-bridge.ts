@@ -21,6 +21,7 @@ import {
   type RelayTabInfo,
   type RelayToExtensionMessage,
 } from "./relay-protocol.ts";
+import { beforeInput, forgetTab } from "./human-input.ts";
 
 const log = createLogger("bridge");
 
@@ -518,6 +519,7 @@ export class ExtensionRelayBridge {
 
   /** A tab left every Claude group (closed, or dragged out): its client loses it. */
   private dropTab(tabId: number): void {
+    forgetTab(tabId);
     const tab = this.tabs.get(tabId);
     if (!tab) return;
     this.tabs.delete(tabId);
@@ -916,7 +918,10 @@ export class ExtensionRelayBridge {
       return;
     }
     if (request.method === "Page.bringToFront") return this.respond(client, request, {}); // see Target.activateTarget
-    const result = await this.execCdp(route.tabId, route.child ? sessionId : undefined, request.method, request.params);
+    const target = route.child ? sessionId : undefined;
+    // Moves the pointer along a human path (and paces keys and scrolls) before Playwright's own event.
+    await beforeInput(route.tabId, request.method, request.params ?? {}, !route.child, (method, params) => this.execCdp(route.tabId, target, method, params));
+    const result = await this.execCdp(route.tabId, target, request.method, request.params);
     this.respond(client, request, result);
   }
 

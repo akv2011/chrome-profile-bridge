@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { chromium as patchright } from "patchright-core";
 import { type Browser, chromium } from "playwright-core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
@@ -205,6 +206,56 @@ describe("daemon end to end with real Playwright", () => {
       await expect(cdp.send(method as "Network.enable", { origin: stack.siteUrl.slice(0, -1), storageTypes: "all" } as object)).rejects.toThrow(/refused/);
     }
     expect(await page.evaluate(() => document.cookie)).toContain("login=kept");
+  }, 60_000);
+
+  it("moves, clicks and types like a person, not like a script", async () => {
+    // Behavioral bot checks score Playwright's teleport: one mousemove straight to the element's exact center,
+    // a press and release a few ms apart, keys typed with no gap.
+    const browser = await connect("E2E_HUMAN_INPUT");
+    const page = await browser.contexts()[0].newPage();
+    await page.goto(stack.siteUrl);
+    await page.evaluate(() => {
+      document.body.insertAdjacentHTML("beforeend", '<button id=far style="position:absolute;left:600px;top:420px;width:120px;height:40px">far</button><input id=t>');
+      const log: Array<{ type: string; x: number; y: number; t: number }> = [];
+      for (const type of ["mousemove", "mousedown", "mouseup", "keydown"])
+        document.addEventListener(type, (e) => { if (e.isTrusted) log.push({ type, x: (e as MouseEvent).clientX ?? 0, y: (e as MouseEvent).clientY ?? 0, t: performance.now() }); }, true);
+      (window as unknown as { __log: typeof log }).__log = log;
+    });
+    await page.mouse.move(40, 40);
+    await page.click("#far");
+    await page.type("#t", "hello");
+    const log = await page.evaluate(() => (window as unknown as { __log: Array<{ type: string; x: number; y: number; t: number }> }).__log);
+    const down = log.findIndex((e) => e.type === "mousedown");
+    const moves = log.slice(0, down).filter((e) => e.type === "mousemove");
+    expect(moves.length).toBeGreaterThan(8); // a path, not a jump
+    const up = log.find((e) => e.type === "mouseup")!;
+    expect(up.t - log[down].t).toBeGreaterThanOrEqual(50); // a held press
+    const keys = log.filter((e) => e.type === "keydown").map((e) => e.t);
+    expect(Math.min(...keys.slice(1).map((t, i) => t - keys[i]))).toBeGreaterThanOrEqual(20); // paced typing
+    expect(await page.inputValue("#t")).toBe("hello");
+  }, 60_000);
+
+  it("hides automation from the page when a script drives it with patchright-core", async () => {
+    // Stock Playwright enables CDP Runtime, which pages detect (/leak counts error.name reads, Chrome 137+).
+    // patchright-core never does; it must work through the relay, main-world evaluate included.
+    const stock = await connect("E2E_LEAK_STOCK");
+    const stockPage = await stock.contexts()[0].newPage();
+    await stockPage.goto(`${stack.siteUrl}leak`);
+    await stockPage.waitForTimeout(800);
+    expect(await stockPage.title()).toBe("automation seen"); // the probe works
+
+    const browser = await patchright.connectOverCDP(stack.cdpUrl("E2E_LEAK_PATCHRIGHT"));
+    try {
+      const page = await browser.contexts()[0].newPage();
+      await page.goto(`${stack.siteUrl}leak`);
+      await page.waitForTimeout(800);
+      expect(await page.title()).toBe("clean");
+      await page.goto(`${stack.siteUrl}state`);
+      // The page's own JS globals, from its main world (4th argument false).
+      expect(await page.evaluate(() => (window as unknown as { appState?: { n: number } }).appState?.n, undefined, undefined, false)).toBe(42);
+    } finally {
+      await browser.close();
+    }
   }, 60_000);
 
   it("Bridge.extract returns in-page data as JSON", async () => {

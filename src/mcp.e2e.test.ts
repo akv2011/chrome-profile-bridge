@@ -51,6 +51,15 @@ describe("playwright-mcp 0.0.82 through the bridge", () => {
     expect(result).toContain("domStorage");
   }, 90_000);
 
+  it("reads the page's own JS state and console, the way agents debug a site", async () => {
+    const call = await mcp("MCP_PAGE_STATE");
+    await call("browser_navigate", { url: `${stack.siteUrl}state` });
+    // Patchright as the MCP's playwright-core (tried 11-12) fails both: it never enables Runtime, so no console,
+    // and evaluate runs in an isolated world. That is why stealth is a script-side choice, not the MCP's.
+    expect(await call("browser_evaluate", { function: "() => window.appState?.n" })).toContain("42");
+    expect(await call("browser_console_messages", { level: "info" })).toContain("hello-console");
+  }, 90_000);
+
   it("gives two agents on one profile their own tabs", async () => {
     const a = await mcp("MCP_B1");
     const b = await mcp("MCP_B2");
