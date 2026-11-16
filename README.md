@@ -128,8 +128,8 @@ Across profiles: `cbb-fanout <name…> [--url <url>] -- "<expression>"` runs one
    back. Undo any time with `bin/full-cdp.sh --undo`.
 3. Map profile names to Chrome profile directories in `~/.chrome-profile-bridge/profiles.json`
    (see `profiles.json.example`; the directory is the last part of "Profile Path" at
-   `chrome://version`), or run `bin/sync-profiles.sh` to add a `pw-*` entry for every signed-in
-   profile automatically. In extension mode only, also Load unpacked
+   `chrome://version`), or run `bin/sync-profiles.sh` to list the signed-in profiles that have none and
+   `bin/sync-profiles.sh "Profile 5"` to add a `pw-*` entry for the ones you name. In extension mode only, also Load unpacked
    `~/.chrome-profile-bridge/extension` in each profile.
 4. `bin/use-bridge.sh` points your `pw-*` MCP entries at the bridge.
    Clients already running keep their old command; with a global `@playwright/mcp`, install.sh

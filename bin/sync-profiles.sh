@@ -1,25 +1,23 @@
 #!/bin/bash
-# Register a pw-* tool for every signed-in Chrome profile that does not have one yet. Idempotent:
-# already-mapped profiles and existing names are skipped. A profile with no signed-in account is
-# skipped until it has one (the watcher re-runs when Chrome updates Local State).
+# Register a pw-* tool for the named Chrome profiles. Opt-in, because a shared Chrome holds other
+# people's accounts too. Idempotent: already-mapped profiles and existing names are skipped.
 #
-#   bin/sync-profiles.sh           add every new profile
-#   bin/sync-profiles.sh --quiet   same, but print only what changed (for the launchd watcher)
+#   bin/sync-profiles.sh                       list signed-in profiles with no tool yet, change nothing
+#   bin/sync-profiles.sh "Profile 5" [...]     register those profile dirs
 set -euo pipefail
 [ "$(uname -s)" = Darwin ] || { echo "sync-profiles: macOS only" >&2; exit 2; }
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
-QUIET=0; [ "${1:-}" = --quiet ] && QUIET=1
-say() { [ "$QUIET" = 1 ] || echo "$@"; }
 
 HOME_DIR="$HOME/.chrome-profile-bridge"
 PROFILES="$HOME_DIR/profiles.json"
 # Full-CDP mode keeps Chrome's data (and Local State) at ~/ChromeData; else the default path.
 CHROME_DIR="$HOME/ChromeData"; [ -d "$CHROME_DIR" ] || CHROME_DIR="$HOME/Library/Application Support/Google/Chrome"
 
-# Profiles that need adding, as "pw-name<TAB>dir<TAB>email" lines. Python does the JSON and naming.
-lines=$(/usr/bin/python3 - "$PROFILES" "$CHROME_DIR/Local State" <<'PY'
+# Candidates (or only the named ones), as "pw-name<TAB>dir<TAB>email" lines. Python does the JSON and
+# naming, and warns about a named dir that is unknown, not signed in or already mapped.
+lines=$(/usr/bin/python3 - "$PROFILES" "$CHROME_DIR/Local State" "$@" <<'PY'
 import json, re, sys
-prof_path, state_path = sys.argv[1], sys.argv[2]
+prof_path, state_path, wanted = sys.argv[1], sys.argv[2], set(sys.argv[3:])
 try: profiles = json.load(open(prof_path))
 except Exception: profiles = {}
 mapped_dirs = set(profiles.values())
@@ -35,7 +33,7 @@ def slug(email):
 
 out = []
 for d, info in sorted(cache.items()):
-    if d in mapped_dirs: continue
+    if d in mapped_dirs or (wanted and d not in wanted): continue
     email = (info.get("user_name") or "").strip()
     if not email: continue                                # not signed in yet; added once it is
     name = "pw-" + slug(email)
@@ -43,13 +41,22 @@ for d, info in sorted(cache.items()):
     while n in taken: n, i = f"{name}-{i}", i + 1          # keep names unique
     taken.add(n)
     out.append(f"{n}\t{d}\t{email}")
+for d in sorted(wanted - {line.split("\t")[1] for line in out}):
+    print(f"sync-profiles: skipped \"{d}\": unknown, not signed in, or already mapped", file=sys.stderr)
 print("\n".join(out))
 PY
 )
 
-[ -n "$lines" ] || { say "sync-profiles: nothing new"; exit 0; }
+[ -n "$lines" ] || { echo "sync-profiles: nothing to add"; exit 0; }
+if [ $# = 0 ]; then
+  echo "Signed-in profiles with no pw-* tool (dir, email, name it would get):"
+  while IFS=$'\t' read -r name dir email; do printf '  %s\t%s\t%s\n' "$dir" "$email" "$name"; done <<< "$lines"
+  echo "Register one: $0 \"<dir>\" [...]"
+  exit 0
+fi
 
-while IFS=$'\t' read -r name dir email; do
+# The lines come in on fd 3, so nothing in the loop that reads stdin can eat the rest.
+while IFS=$'\t' read -r name dir email <&3; do
   [ -n "$name" ] || continue
   # 1) name -> dir in profiles.json (atomic via a temp file)
   /usr/bin/python3 - "$PROFILES" "$name" "$dir" <<'PY'
@@ -67,5 +74,5 @@ PY
     claude mcp remove "$name" -s user >/dev/null 2>&1 || true
     claude mcp add "$name" -s user -- /opt/homebrew/bin/node "$HOME/.local/bin/cbb-mcp" "$name" >/dev/null
   fi
-  say "sync-profiles: added $name -> \"$dir\" ($email)"
-done <<< "$lines"
+  echo "sync-profiles: added $name -> \"$dir\" ($email)"
+done 3<<< "$lines"
